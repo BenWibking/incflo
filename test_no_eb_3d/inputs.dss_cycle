@@ -1,0 +1,30 @@
+# Modeled 19-fold seed. T=nu=1, full similarity period S=0.36.
+stop_time = 0.3023236739289689
+max_step = -1
+steady_state = 0
+geometry.prob_lo = -96 -96 -96
+geometry.prob_hi = 96 96 96
+geometry.is_periodic = 1 1 1
+amr.n_cell = 96 96 96
+amr.max_level = 0
+amr.max_grid_size = 32
+
+incflo.probtype = 0
+incflo.initial_velocity_plotfile = seed
+incflo.constant_density = 1
+incflo.ro_0 = 1
+incflo.mu = 1
+incflo.gravity = 0 0 0
+incflo.delp = 0 0 0
+incflo.advect_tracer = 0
+incflo.advection_type = MOL
+incflo.diffusion_type = 0
+incflo.cfl = 0.45
+incflo.do_initial_proj = 1
+incflo.verbose = 1
+
+# Physical-time spacing chosen to include the exact similarity half-period;
+# incflo also writes the initial and final states.
+amr.plot_per_exact = 0.16472978858872797
+amr.check_int = -1
+amr.plotVariables = velx vely velz density vort

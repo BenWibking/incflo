@@ -51,7 +51,13 @@ void incflo::Advance(double cur_time)
     set_eb_bcs();
 #endif
 
+#ifdef INCFLO_ENZYME
+    if (m_dss_enabled && m_dss_gradient) dssRecord();
+#endif
     ApplyPredictor();
+#ifdef INCFLO_ENZYME
+    if (m_dss_enabled && m_dss_gradient) dssRecord();
+#endif
 
     if (m_advection_type == "MOL") {
         for (int lev = 0; lev <= finest_level; ++lev) {

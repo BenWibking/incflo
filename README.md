@@ -40,6 +40,11 @@ Note that, depending on where you have put the amrex and AMReX-Hydro repos
 in your local working space, you may need to set AMREX_HOME and AMREX_HYDRO_HOME
 either as environment variables or in incflo/test*/GNUmakefile.
 
+## Search for a self-similar flow
+
+The [one-cycle search guide](test_no_eb_3d/README.dss_search.md) covers the Enzyme
+adjoint, the L-BFGS driver, and an eight-seed smoke test on one Setonix GPU node.
+
 # Contributing
 
 We welcome contributions in the form of pull-requests from anyone. For more

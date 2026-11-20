@@ -190,6 +190,31 @@ endif ()
 
 add_executable(incflo)
 
+set(INCFLO_ENZYME_PLUGIN "" CACHE FILEPATH "ClangEnzyme pass plugin for the CPU DSS adjoint")
+set(INCFLO_ENZYME_DEVICE_BC "" CACHE FILEPATH "ROCm-assembled Enzyme face pullbacks for the HIP DSS adjoint")
+if(INCFLO_ENZYME_PLUGIN OR INCFLO_ENZYME_DEVICE_BC)
+  if(NOT INCFLO_DIM EQUAL 3 OR INCFLO_CUDA OR INCFLO_SYCL OR INCFLO_EB)
+    message(FATAL_ERROR "The DSS adjoint requires a 3D regular-grid CPU or HIP build")
+  endif()
+  target_compile_definitions(incflo PRIVATE INCFLO_ENZYME)
+  target_sources(incflo PRIVATE src/dss/incflo_dss_adjoint.cpp)
+  if(INCFLO_HIP)
+    if(NOT EXISTS "${INCFLO_ENZYME_DEVICE_BC}" OR INCFLO_ENZYME_PLUGIN)
+      message(FATAL_ERROR "For HIP, supply INCFLO_ENZYME_DEVICE_BC built for the target ROCm compiler")
+    endif()
+    set_source_files_properties(src/dss/incflo_dss_adjoint.cpp PROPERTIES
+      OBJECT_DEPENDS "${INCFLO_ENZYME_DEVICE_BC}"
+      COMPILE_OPTIONS "-Xclang=-mlink-builtin-bitcode;-Xclang=${INCFLO_ENZYME_DEVICE_BC}")
+  else()
+    if(NOT CMAKE_CXX_COMPILER_ID STREQUAL "Clang" OR NOT EXISTS "${INCFLO_ENZYME_PLUGIN}")
+      message(FATAL_ERROR "Select upstream Clang and its matching ClangEnzyme plugin")
+    endif()
+    target_sources(incflo PRIVATE src/dss/incflo_dss_faces.cpp)
+    set_source_files_properties(src/dss/incflo_dss_faces.cpp PROPERTIES
+      COMPILE_OPTIONS "-fpass-plugin=${INCFLO_ENZYME_PLUGIN}")
+  endif()
+endif()
+
 #target_link_libraries(incflo PUBLIC AMReX::amrex amrex_hydro)
 target_link_libraries(incflo PUBLIC amrex_hydro) #link to amrex through amrex_hydro
 

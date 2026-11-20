@@ -151,6 +151,13 @@ void incflo::InitData ()
 void incflo::Evolve()
 {
     BL_PROFILE("incflo::Evolve()");
+#ifdef INCFLO_ENZYME
+    dssStart();
+#else
+    bool dss_enabled = false;
+    ParmParse("dss").query("enabled", dss_enabled);
+    if (dss_enabled) Abort("dss.enabled requires an Enzyme-enabled incflo build");
+#endif
 
     // Track elapsed time in double locally to avoid float32 accumulation drift
     // in single-precision builds; m_cur_time stays Real for AMReX interfaces.
@@ -235,6 +242,10 @@ void incflo::Evolve()
             (stop_time_reached(cur_time) ||
              (m_max_step >= 0 && m_nstep >= m_max_step));
     }
+
+#ifdef INCFLO_ENZYME
+    if (m_dss_enabled) dssFinish();
+#endif
 
     // Output at the final time
     if( m_check_int > 0 && m_nstep != m_last_chk) {

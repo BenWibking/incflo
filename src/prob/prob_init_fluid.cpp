@@ -1,4 +1,8 @@
 #include <incflo.H>
+#include <AMReX_PlotFileUtil.H>
+
+#include <algorithm>
+#include <limits>
 
 using namespace amrex;
 
@@ -31,6 +35,37 @@ void incflo::prob_init_fluid (int lev)
 
     if (m_use_temperature) {
         ld.temperature.setVal(m_ic_tem);
+    }
+
+#ifdef INCFLO_ENZYME
+    if (dssReadControl(lev)) return;
+#endif
+
+    // A phase-zero snapshot can supply the velocity on a uniform mesh. Leave
+    // density, tracers and the normal incflo initialization/projection intact.
+    std::string velocity_file;
+    if (ParmParse("incflo").query("initial_velocity_plotfile", velocity_file)) {
+        AMREX_ALWAYS_ASSERT_WITH_MESSAGE(m_probtype == 0 && max_level == 0,
+            "initial_velocity_plotfile requires incflo.probtype=0 and amr.max_level=0");
+        PlotFileData input(velocity_file);
+        AMREX_ALWAYS_ASSERT_WITH_MESSAGE(input.spaceDim() == AMREX_SPACEDIM &&
+            input.finestLevel() == 0 && input.coordSys() == geom[lev].Coord() &&
+            input.probDomain(0) == domain && input.boxArray(0).contains(domain),
+            "Initial velocity plotfile does not cover the configured mesh");
+        for (int d = 0; d < AMREX_SPACEDIM; ++d) {
+            Real const tol = 32 * std::numeric_limits<Real>::epsilon() * geom[lev].ProbLength(d);
+            AMREX_ALWAYS_ASSERT_WITH_MESSAGE(std::abs(input.probLo()[d] - problo[d]) <= tol &&
+                std::abs(input.probHi()[d] - probhi[d]) <= tol, "Initial velocity plotfile bounds differ");
+            auto const name = std::string("velocity_") + "xyz"[d];
+            auto const& names = input.varNames();
+            AMREX_ALWAYS_ASSERT_WITH_MESSAGE(std::find(names.begin(), names.end(), name) != names.end(),
+                "Missing initial velocity field " + name);
+            ld.velocity.ParallelCopy(input.get(0, name), 0, d, 1);
+        }
+        AMREX_ALWAYS_ASSERT_WITH_MESSAGE(ld.velocity.is_finite(0, AMREX_SPACEDIM, 0),
+            "Nonfinite velocity in initial plotfile");
+        Print() << "Initialized velocity from " << velocity_file << "\n";
+        return;
     }
 
     for (MFIter mfi(ld.density); mfi.isValid(); ++mfi)

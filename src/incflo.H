@@ -397,6 +397,19 @@ public:
     void InitialPressureProjection ();
 
 private:
+#ifdef INCFLO_ENZYME
+    bool m_dss_enabled = false;
+    bool m_dss_gradient = true;
+    amrex::MultiFab m_dss_initial;
+    amrex::Vector<amrex::MultiFab> m_dss_stages;
+    bool dssReadControl(int lev);
+    void dssStart();
+    void dssRecord();
+    void dssFinish();
+    void dssProject(amrex::MultiFab& velocity) const;
+    void dssProjectFaces(amrex::Array<amrex::MultiFab,3>& faces) const;
+    amrex::MultiFab dssRhsTranspose(const amrex::MultiFab& state, const amrex::MultiFab& weight);
+#endif
 
     //
     // member variables
