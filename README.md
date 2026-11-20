@@ -43,7 +43,8 @@ either as environment variables or in incflo/test*/GNUmakefile.
 ## Search for a self-similar flow
 
 The [one-cycle search guide](test_no_eb_3d/README.dss_search.md) covers the Enzyme
-adjoint, the L-BFGS driver, and an eight-seed smoke test on one Setonix GPU node.
+adjoint, parallel 128³ GPU optimization with Optimas on Setonix, independent
+192³ replays and a Bash helper for downloading the best field's vorticity profile.
 
 # Contributing
 

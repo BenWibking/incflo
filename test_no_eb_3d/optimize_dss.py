@@ -17,6 +17,8 @@ from scipy.optimize import minimize
 S = 0.36
 T_END = -math.expm1(-S)
 HALF_BOX = 96.0
+MIN_SEARCH_GRID = 128
+DEFAULT_SEARCH_STEPS = 96
 
 
 def modeled_seed(n):
@@ -94,6 +96,14 @@ def load_seed(path, n=None):
             ]
         )
     return np.ascontiguousarray(u, dtype=np.float64)
+
+
+def search_seed(path, n):
+    if n < MIN_SEARCH_GRID:
+        raise ValueError(
+            f"Optimization requires at least {MIN_SEARCH_GRID} cells per dimension"
+        )
+    return modeled_seed(n) if path is None else load_seed(path, n)
 
 
 class CylindricalModes:
@@ -280,7 +290,7 @@ def search(args):
         m <= 0 or m % 19 for m in args.harmonics
     ):
         raise ValueError("Choose distinct positive multiples of 19 as harmonics")
-    seed = load_seed(args.seed, args.n)
+    seed = search_seed(args.seed, args.n)
     modes = CylindricalModes(seed, args.nr, args.nz, args.harmonics)
     cycle = Cycle(args.exe, args.inputs, args.n, args.steps)
     args.out.mkdir(parents=True, exist_ok=False)
@@ -373,7 +383,9 @@ def search(args):
         "evaluations": len(rows),
         "termination": str(result.message),
     }
-    (root / "search.json").write_text(json.dumps(report, indent=2) + "\n")
+    pending = root / "search.json.tmp"
+    pending.write_text(json.dumps(report, indent=2) + "\n")
+    pending.replace(root / "search.json")
     print(json.dumps(report), flush=True)
 
 
@@ -382,7 +394,7 @@ if __name__ == "__main__":
     sub = parser.add_subparsers(dest="action", required=True)
     generate = sub.add_parser("generate")
     generate.add_argument("output", type=Path)
-    generate.add_argument("--n", type=int, default=96)
+    generate.add_argument("--n", type=int, default=MIN_SEARCH_GRID)
     pack = sub.add_parser("pack")
     pack.add_argument("plotfile", type=Path)
     pack.add_argument("output", type=Path)
@@ -394,10 +406,14 @@ if __name__ == "__main__":
     base.add_argument("--out", type=Path, required=True)
     sub.add_parser("check", parents=[base])
     opt = sub.add_parser("search", parents=[base])
-    opt.add_argument("--seed", type=Path, required=True)
+    opt.add_argument(
+        "--seed",
+        type=Path,
+        help="Override the modeled seed generated on the search grid",
+    )
     opt.add_argument("--random-seed", type=int, required=True)
-    opt.add_argument("--n", type=int, default=96)
-    opt.add_argument("--steps", type=int, default=48)
+    opt.add_argument("--n", type=int, default=MIN_SEARCH_GRID)
+    opt.add_argument("--steps", type=int, default=DEFAULT_SEARCH_STEPS)
     opt.add_argument("--nr", type=int, default=9)
     opt.add_argument("--nz", type=int, default=7)
     opt.add_argument("--harmonics", type=int, nargs="+", default=[19])
