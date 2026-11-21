@@ -43,6 +43,7 @@ class OrbitEquation:
             raise ValueError(
                 "The radial linear block is numerically singular; reduce its degree or use Jacobi modes"
             )
+        self.reference_linear = [host(f[-1]) for f in factors]
         self.inv = space.linear_inverse(factors)
         self.force = self.fluid(self.ref, 0.0)
 
@@ -62,26 +63,7 @@ class OrbitEquation:
         ]
 
     def jacobian(self, y):
-        """Exact quadratic polarization in the field and a centered log-period column."""
-        x, log_s = y[:-2], y[-2]
-        factors = self.space.factors(self.period * math.exp(log_s))
-        background = self.space.fields(self.space.tensor(self.scale * x), factors)
-        eps = 1e-5
-        period_column = (self.fluid(x, log_s + eps) - self.fluid(x, log_s - eps)) / (
-            2 * eps
-        )
-
-        def apply(dy):
-            dx = dy[:-2]
-            raw = self.space.residual(
-                self.space.tensor(self.scale * dx), factors, background=background
-            )
-            return np.r_[
-                self.scaled(raw) + period_column * dy[-2] - self.force * dy[-1],
-                self.phase @ dx,
-            ]
-
-        return apply
+        return OrbitJacobian(self, y)
 
     def metrics(self, y, raw=None):
         x = y[:-2]
@@ -101,26 +83,113 @@ class OrbitEquation:
         }
 
 
-def correct(eq, predictor, normal, tolerance, iterations, krylov, *, deflate=False):
-    y = predictor.copy()
+class OrbitJacobian:
+    """Derivative of the reference-scaled equations, including the free period."""
 
-    def multiplier(point):
-        if not deflate:
-            return 1.0, np.zeros_like(point)
-        # Shifted inverse-square deflation repels the entire zero-wave subspace.
-        part = point[:-2][eq.wave]
-        norm2 = max(part @ part, 1e-28)
-        strength = (eq.ref[eq.wave] @ eq.ref[eq.wave]) / norm2
+    def __init__(self, eq, point):
+        self.eq = eq
+        x, log_s = point[:-2], point[-2]
+        self.factors = eq.space.factors(eq.period * math.exp(log_s))
+        self.background = eq.space.fields(eq.space.tensor(eq.scale * x), self.factors)
+        eps = 1e-5
+        self.period_column = (eq.fluid(x, log_s + eps) - eq.fluid(x, log_s - eps)) / (
+            2 * eps
+        )
+
+    def field(self, dx):
+        eq = self.eq
+        raw = eq.space.residual(eq.scale * dx, self.factors, background=self.background)
+        return eq.space.scale_residual(raw, eq.inv) / eq.scale
+
+    def __call__(self, dy):
+        eq = self.eq
+        fluid = host(self.field(eq.space.tensor(dy[:-2])))
+        return np.r_[
+            fluid + self.period_column * dy[-2] - eq.force * dy[-1], eq.phase @ dy[:-2]
+        ]
+
+    def transpose(self, rhs):
+        # Only methods requesting J^T pay for a reverse pass through the linear field map.
+        eq = self.eq
+        with torch.enable_grad():
+            dx = eq.space.tensor(np.zeros_like(eq.ref)).requires_grad_()
+            (dual,) = torch.autograd.grad(self.field(dx), dx, eq.space.tensor(rhs[:-1]))
+        return np.r_[
+            host(dual) + eq.phase * rhs[-1],
+            self.period_column @ rhs[:-1],
+            -eq.force @ rhs[:-1],
+        ]
+
+
+class CorrectorSystem:
+    """The same augmented nonlinear equations for every corrector backend."""
+
+    def __init__(self, eq, predictor, normal, deflate):
+        self.eq, self.predictor, self.normal, self.deflate = (
+            eq,
+            predictor,
+            normal,
+            deflate,
+        )
+
+    def multiplier(self, point):
         derivative = np.zeros_like(point)
-        derivative[:-2][eq.wave] = -2 * strength / norm2 * part
+        if not self.deflate:
+            return 1.0, derivative
+        part = point[:-2][self.eq.wave]
+        norm2 = part @ part
+        strength = (self.eq.ref[self.eq.wave] @ self.eq.ref[self.eq.wave]) / max(
+            norm2, 1e-28
+        )
+        if norm2 > 1e-28:
+            derivative[:-2][self.eq.wave] = -2 * strength / norm2 * part
         return 1 + strength, derivative
 
-    def fun(point):
-        residual = eq.residual(point)
-        residual[:-1] *= multiplier(point)[0]
-        return np.r_[residual, normal @ (point - predictor)]
+    def residual(self, point):
+        residual = self.eq.residual(point)
+        residual[:-1] *= self.multiplier(point)[0]
+        return np.r_[residual, self.normal @ (point - self.predictor)]
 
-    f = fun(y)
+    def linearize(self, point, residual):
+        weight, derivative = self.multiplier(point)
+        return CorrectorJacobian(
+            self.eq.jacobian(point),
+            self.normal,
+            weight,
+            derivative,
+            residual[:-2] / weight,
+        )
+
+
+class CorrectorJacobian:
+    def __init__(self, orbit, normal, weight, derivative, fluid_residual):
+        self.orbit, self.normal = orbit, normal
+        self.weight, self.derivative, self.fluid_residual = (
+            weight,
+            derivative,
+            fluid_residual,
+        )
+
+    def __call__(self, dy):
+        delta = self.orbit(dy)
+        delta[:-1] = self.weight * delta[:-1] + self.fluid_residual * (
+            self.derivative @ dy
+        )
+        return np.r_[delta, self.normal @ dy]
+
+    def transpose(self, rhs):
+        result = self.orbit.transpose(np.r_[self.weight * rhs[:-2], rhs[-2]])
+        return (
+            result
+            + self.derivative * (self.fluid_residual @ rhs[:-2])
+            + self.normal * rhs[-1]
+        )
+
+
+def correct(eq, predictor, normal, tolerance, iterations, krylov, *, deflate=False):
+    y = predictor.copy()
+    system = CorrectorSystem(eq, predictor, normal, deflate)
+    f = system.residual(y)
     linear_counts = []
     for iteration in range(iterations + 1):
         norm = np.linalg.norm(f)
@@ -128,16 +197,8 @@ def correct(eq, predictor, normal, tolerance, iterations, krylov, *, deflate=Fal
             return y, linear_counts, True
         if iteration == iterations or not np.isfinite(norm):
             break
-        jac = eq.jacobian(y)
-        scale, derivative = multiplier(y)
-        original = f[:-2] / scale
-
-        def bordered(dy, action=jac, weight=scale, dw=derivative, base=original):
-            delta = action(dy)
-            delta[:-1] = weight * delta[:-1] + base * (dw @ dy)
-            return np.r_[delta, normal @ dy]
-
-        op = LinearOperator((y.size, y.size), matvec=bordered, dtype=np.float64)
+        jac = system.linearize(y, f)
+        op = LinearOperator((y.size, y.size), matvec=jac, dtype=np.float64)
         history = []
         step, info = gmres(
             op,
@@ -155,7 +216,7 @@ def correct(eq, predictor, normal, tolerance, iterations, krylov, *, deflate=Fal
         damping = min(1.0, 1.0 / max(abs(step[-2]), 1.0))
         for _ in range(12):
             trial = y + damping * step
-            ahead = fun(trial)
+            ahead = system.residual(trial)
             if (
                 np.isfinite(ahead).all()
                 and np.linalg.norm(ahead) <= (1 - 1e-4 * damping) * norm
@@ -264,6 +325,12 @@ def run_search(args):
         or not 0 < args.min_spiral < 1
     ):
         raise ValueError("Invalid continuation or Newton settings")
+    if args.solver == "petsc":
+        from similarity_petsc import petsc_correct, petsc_runtime
+
+        petsc_runtime()
+    elif args.snes_type or args.pc:
+        raise ValueError("--snes-type and --pc require --solver petsc")
     dev = backend(args.device)
     if args.restart:
         cfg, seed, y, previous, step, accepted = source
@@ -334,10 +401,43 @@ def run_search(args):
         "device": dev,
         "hardware": torch.cuda.get_device_name() if dev == "cuda" else "CPU",
         "hip": torch.version.hip,
+        "solver": args.solver,
         "stages": [],
         "rejected_steps": 0,
     }
     initial_accepted = accepted
+
+    def correct_point(predictor, normal, deflate):
+        if args.solver == "scipy":
+            return correct(
+                eq,
+                predictor,
+                normal,
+                args.tol,
+                args.newton,
+                args.krylov,
+                deflate=deflate,
+            )
+
+        def monitor(it, norm, linear_steps):
+            print(
+                f"SNES iteration={it} residual={norm:.8g} total_ksp={linear_steps}",
+                flush=True,
+            )
+
+        system = CorrectorSystem(eq, predictor, normal, deflate)
+        candidate, counts, converged, info = petsc_correct(
+            system,
+            args.tol,
+            args.newton,
+            args.krylov,
+            method=args.snes_type or "newtonls",
+            preconditioner=args.pc or "bordered",
+            monitor=monitor,
+        )
+        info.update(starting_forcing=float(predictor[-1]), deflated=bool(deflate))
+        report.setdefault("petsc_correctors", []).append(info)
+        return candidate, counts, converged
 
     def save(status, metrics=None):
         report.update(
@@ -356,12 +456,13 @@ def run_search(args):
         report["direct_start"] = eq.metrics(predictor)
         normal = np.zeros_like(y)
         normal[-1] = 1.0
-        candidate, counts, converged = correct(
-            eq, predictor, normal, args.tol, args.newton, args.krylov, deflate=True
-        )
+        candidate, counts, converged = correct_point(predictor, normal, True)
         candidate[-1] = 0.0
         met = eq.metrics(candidate)
-        report["direct_gmres_iterations"] = counts
+        if args.solver == "scipy":
+            report["direct_gmres_iterations"] = counts
+        else:
+            report["direct_ksp_iterations"] = counts
         if min(met["relative_spiral"], met["relative_field"]) < args.min_spiral:
             report["rejected_candidate"] = met
             save("lost_nonzero_branch")
@@ -384,18 +485,14 @@ def run_search(args):
             predictor[-1] = 0.0
             normal = np.zeros_like(tangent)
             normal[-1] = 1.0
-        candidate, counts, converged = correct(
-            eq, predictor, normal, args.tol, args.newton, args.krylov, deflate=target
-        )
+        candidate, counts, converged = correct_point(predictor, normal, target)
         if converged and not target and candidate[-1] <= 0:
             # A curved correction crossed the endpoint. Solve at exactly zero forcing.
             predictor = candidate.copy()
             predictor[-1] = 0
             normal = np.zeros_like(tangent)
             normal[-1] = 1
-            candidate, extra, converged = correct(
-                eq, predictor, normal, args.tol, args.newton, args.krylov, deflate=True
-            )
+            candidate, extra, converged = correct_point(predictor, normal, True)
             counts += extra
             target = True
         if not converged:
@@ -417,8 +514,9 @@ def run_search(args):
             return
         previous, y = y, candidate
         accepted += 1
+        count_key = "gmres_iterations" if args.solver == "scipy" else "ksp_iterations"
         report["stages"].append(
-            dict(stage=accepted, arclength_step=step, gmres_iterations=counts, **met)
+            dict(stage=accepted, arclength_step=step, **{count_key: counts}, **met)
         )
         print(
             f"stage={accepted} forcing={y[-1]:.6g} period={met['period']:.7g} "
@@ -625,6 +723,13 @@ def parser():
     s.add_argument("--step", type=float, default=0.2)
     s.add_argument("--min-step", type=float, default=0.001)
     s.add_argument("--max-stages", type=int, default=24)
+    s.add_argument("--solver", choices=("scipy", "petsc"), default="scipy")
+    s.add_argument("--snes-type", help="PETSc SNES method (default newtonls)")
+    s.add_argument(
+        "--pc",
+        choices=("bordered", "none"),
+        help="PETSc Krylov preconditioner (default bordered)",
+    )
     s.add_argument("--newton", type=int, default=7)
     s.add_argument("--krylov", type=int, default=40)
     s.add_argument("--tol", type=float, default=1e-7)

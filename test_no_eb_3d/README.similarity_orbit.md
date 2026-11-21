@@ -1,6 +1,6 @@
 # Searching for a periodic orbit in similarity coordinates
 
-`solve_similarity_orbit.py` solves for a three-dimensional velocity field over a full similarity period and for the period itself. It uses a space-time Galerkin discretization on all of space. PyTorch evaluates the field, nonlinear terms and linearized operator in double precision on one GPU. SciPy runs the Newton–GMRES iteration. The existing incflo executable can replay the resulting initial field independently in physical time.
+`solve_similarity_orbit.py` solves for a three-dimensional velocity field over a full similarity period and for the period itself. It uses a space-time Galerkin discretization on all of space. PyTorch evaluates the field, nonlinear terms and linearized operator in double precision on one GPU. The default corrector uses SciPy Newton–GMRES. The optional PETSc SNES backend supplies line-search and trust-region Newton methods. The existing incflo executable can replay the resulting initial field independently in physical time.
 
 ## Run on Setonix
 
@@ -35,6 +35,30 @@ python3 "$driver" search --lift orbit/stages/stage-0001.npz --direct --device gp
 
 A lift embeds the original radial and angular coefficients exactly and carries over the fitted period. A lift without `--direct` starts a new continuation whose forcing is the residual of that field in the larger space. For distinct modeled starts, vary `--amplitude` and `--wave` or set a positive `--jitter` and vary `--seed`.
 
+## PETSc SNES
+
+Use a real double-precision PETSc and petsc4py in the same Python environment as PyTorch. On Setonix, run the following once inside a CPU allocation. The build uses a single-rank PETSc and the ROCm container's OpenBLAS. An optional second argument to the installer specifies a wheelhouse with the pinned source archives and build dependencies for an offline build.
+
+```bash
+module load pytorch/2.13.0-rocm7.2.4
+pytorch-exec /bin/bash src/test_no_eb_3d/setonix/install_similarity_petsc.sh "$PWD/snes-env"
+```
+
+The batch launcher discovers `snes-env` in its submission directory. Submit one search per GPU die, for example
+
+```bash
+sbatch -A YOUR_PROJECT-gpu src/test_no_eb_3d/setonix/similarity.sbatch \
+    --replay build/incflo.ex --solver petsc --snes-type newtonls --pc bordered \
+    --direct --grid 160 --radial 9 --degrees 9 --azimuthal 4 --temporal 4 \
+    --seed 19002 --jitter 0.05 --newton 200 --krylov 80
+```
+
+`--snes-type newtontr` selects trust-region Newton. Both methods use the same augmented residual, Jacobian products and checkpoint format, so `--restart` works across backends. The coefficient vectors live on one host rank. Field evaluations, linearized advection and the transpose action run on the selected device. The transpose differentiates the linear field map in reverse mode when the nonlinear method requests it.
+
+The residual always carries the reference radial Stokes–dilation inverse. PETSc's `--pc bordered` updates each radial inverse to the current period and solves a three-variable Schur complement for the period, forcing and inverse-square deflation derivative. It includes both scalar constraints. Velocity advection remains in the exact Jacobian action. A singular small border falls back to radial scaling for that linearization. `--pc none` gives a baseline with the same residual and the same right-GMRES stopping norm.
+
+Standard PETSc options use the prefix `orbit_`. For example, set `PETSC_OPTIONS='-orbit_ksp_rtol 0.01 -orbit_ksp_monitor_true_residual'` in the run environment to change and monitor the inner solve. The default inner relative tolerance is 0.03. `--newton` and `--krylov` set the default outer and inner iteration limits. Each SNES iteration prints the nonlinear residual and cumulative Krylov count. In `search.json`, `petsc_correctors` records each attempt's SNES and KSP termination reasons, residual history and border fallback count. The search also checks the actual augmented residual against `--tol` before accepting a corrector. [PETSc SNES manual](https://petsc.org/release/manual/snes/)
+
 ## Equation and field representation
 
 With unit viscosity, similarity position $y$, similarity time $s$, and modified pressure $H$, the solver imposes
@@ -56,6 +80,17 @@ $$
 Spatial derivatives are taken at fixed $s$ and include derivatives of this phase. Its logarithmic winding allows the time-dependent far field to follow the similarity dilation. The radial functions use Jacobi polynomials. The default radial map scale of 10 and winding radius of 60 are numerical choices. Appendix C of Alpöge and Buckmaster describes piecewise polynomial elements and a continuation from a forced axisymmetric state through rotating waves. The public materials supply the equations and symmetries. The starting coefficients and forcing here are modeled. [Paper, Appendix C.1–C.3](https://github.com/tristanbuckmaster/navier-stokes/blob/main/paper/finite-time-blow-up-navier-stokes.pdf)
 
 The default expansion has eight radial coefficients and eight polar degrees per allowed azimuthal order, $j\le3$ and $n\le3$, for **1,792 real field coefficients**. The period is a further unknown. At `--grid 128`, the integrals use 128 radial nodes, 128 polar nodes and ten azimuthal samples per 19-fold sector, equivalent to 190 over the full circle. Ten time samples integrate products through the retained temporal bandwidth. The azimuthal and time rules use more than three times the highest retained index so quadratic products can be projected without aliasing. Increasing `--grid` refines quadrature. Increasing `--radial`, `--degrees`, `--azimuthal` or `--temporal` gives the field more degrees of freedom.
+
+### Recovering physical space and time
+
+For collapse at the origin at time $T$, use $s=\log[T/(T-t)]$ and $y=x/\sqrt{T-t}$. A periodic similarity velocity $W$ gives
+
+$$
+u(x,t)=(T-t)^{-1/2}W(s,y),\qquad
+\omega(x,t)=(T-t)^{-1}(\nabla_y\times W)(s,y),\qquad t<T.
+$$
+
+One full period gives every pre-collapse time by setting the phase fraction in `sample_cartesian` to $(s/S)\bmod 1$. The checkpoint contains the spatial and temporal mode coefficients and the fitted period. The evaluator includes the radius-dependent phase winding. These formulas reconstruct the exactly discretely self-similar flow when the profile solves the unforced equations. The paper's compactly supported initial data lead to a separate finite-energy flow that approaches the profile in similarity coordinates near blow-up. [Paper, equations (1.2)–(1.6) and Theorem 1.1](https://github.com/tristanbuckmaster/navier-stokes/blob/main/paper/finite-time-blow-up-navier-stokes.pdf)
 
 ## Continuation and interpretation
 
@@ -90,10 +125,21 @@ Run the independent Cartesian derivative, symmetry, far-field, weak-equation, Ja
 uv run --no-project --with numpy --with scipy --with torch python test_no_eb_3d/test_similarity_orbit.py -v
 ```
 
-Pass `--gpu -v` to the test script inside a GPU allocation to run the same checks against the accelerated operator.
+Pass `--gpu -v` to the test script inside a GPU allocation to run the same checks against the accelerated operator. With petsc4py installed, the suite also recovers the known forced solution with both SNES methods, exercises restart and deflation, and checks the actual residual after an early PETSc stopping reason.
 
 ### Setonix results
 
 Job `53513055` used one MI250X GPU die, the default 1,792 coefficients, a maximum arclength step of 0.15 and 72 GMRES directions. Eight continuation steps reduced the forcing from 1 to 0.111971 at a period of 0.385601. The next correction reduced the spiral to 1.17% of its reference coefficient norm and triggered the 5% rejection threshold. The checkpoint retained the preceding field, with 12.07% of the initial spiral norm. Its forced Newton residual was 2.18e-8. Its unforced weak defect was 3.36093 at all three quadratures and 3.36120 with 3,726 test coefficients. An independent 128³ incflo run over 144 steps measured a relative velocity return error of 44.41%.
 
 Job `53513447` lifted the fourth continuation point into 3,726 coefficients and ran 14 deflated Newton steps at exactly zero forcing on the 160-point mesh. The period moved from 0.375987 to 0.395549. The normalized weak defect was 4.19573 on all three quadratures and 4.19592 with 6,600 test coefficients. The separate 128³ incflo replay over 144 steps measured a **55.21% velocity return error**. The search recorded `direct_unconverged`. All eight implementation tests passed on both CPU and MI250X, including the Cartesian weak-equation check and recovery of the period of a manufactured forced solution.
+
+Job `53517682` ran the SciPy direct search from seed 19002 with jitter 0.05, 3,726 coefficients and 160 radial and polar nodes. It used all 200 Newton iterations and 15,233 GMRES iterations. GMRES reached the limit of 80 on 184 solves. The final preconditioned unforced relative defect was 0.07915 at period 2.03901. The 128³ physical-time return error was 100.13%.
+
+Job `53520094` compared PETSc 3.26.1 line-search Newton on the same MI250X die, using right GMRES with relative tolerance 0.03 and a limit of 80. Each pair started from identical coefficients, period and phase reference. Both preconditioner choices retained reference-period residual scaling. The numbers in each cell are GMRES iterations for successive Newton solves.
+
+| Starting field | No additional preconditioner | Bordered radial preconditioner |
+| --- | --- | --- |
+| Fresh seed 19002 | 55, 31, 51 | 33, 35, 75 |
+| Checkpoint after 200 SciPy iterations | 80, linear solve failed | 6, 6, 8 |
+
+The bordered restart reduced the augmented residual from 0.120827 to 0.120735 in three Newton steps. Its independent 128³ incflo replay over 144 steps gave a relative velocity return error of 100.12%. The checkpoint is an unconverged candidate. All eleven similarity tests passed on the MI250X and on CPU.

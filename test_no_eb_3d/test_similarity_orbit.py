@@ -1,5 +1,6 @@
 """Independent Cartesian and integral checks of the similarity-coordinate solver."""
 
+import importlib.util
 import json
 import math
 import os
@@ -12,7 +13,9 @@ import numpy as np
 import torch
 from scipy.special import roots_legendre
 from similarity_galerkin import Basis, OrbitSpace, sample_cartesian, transfer
+from similarity_petsc import BorderedStokes, petsc_correct
 from solve_similarity_orbit import (
+    CorrectorSystem,
     OrbitEquation,
     backend,
     checkpoint,
@@ -150,6 +153,98 @@ class SimilarityTest(unittest.TestCase):
         np.testing.assert_allclose(found, solution, atol=2e-7)
         self.assertAlmostEqual(eq.metrics(found)["period"], self.period, places=7)
 
+    def test_augmented_actions_and_bordered_stokes_inverse(self):
+        eq = self.eq
+        rng = np.random.default_rng(125)
+        point = np.r_[eq.ref, 0.18, 0.4]
+        direction, dual, normal = rng.normal(size=(3, len(point)))
+        for deflate in (False, True):
+            if deflate:
+                normal = np.zeros_like(point)
+                normal[-1] = 1.0
+                point[-1] = 0.0
+            system = CorrectorSystem(eq, point, normal, deflate)
+            jac = system.linearize(point, system.residual(point))
+            eps = 2e-6
+            fd = (
+                system.residual(point + eps * direction)
+                - system.residual(point - eps * direction)
+            ) / (2 * eps)
+            np.testing.assert_allclose(jac(direction), fd, rtol=2e-6, atol=2e-7)
+            np.testing.assert_allclose(
+                jac.transpose(dual) @ direction,
+                dual @ jac(direction),
+                rtol=2e-12,
+                atol=2e-12,
+            )
+
+            # Apply the approximate operator independently using the Galerkin blocks.
+            # Recover an arbitrary input, including both scalar components.
+            space = eq.space
+            factors = space.factors(eq.period * np.exp(point[-2]))
+            blocks = [
+                (f[-1] @ c.unsqueeze(-1)).squeeze(-1)
+                for f, c in zip(
+                    factors, space.unpack(space.tensor(direction[:-2])), strict=True
+                )
+            ]
+            field = space.scale_residual(space.pack(blocks), eq.inv).cpu().numpy()
+            field += jac.orbit.period_column * direction[-2] - eq.force * direction[-1]
+            rhs = np.r_[
+                jac.weight * field + jac.fluid_residual * (jac.derivative @ direction),
+                eq.phase @ direction[:-2],
+                normal @ direction,
+            ]
+            pc = BorderedStokes(jac)
+            self.assertIsNotNone(pc.border_inverse)
+            np.testing.assert_allclose(pc(rhs), direction, atol=3e-11, rtol=3e-11)
+
+        duplicate = np.r_[eq.phase, 0.0, 0.0]
+        system = CorrectorSystem(eq, point, duplicate, True)
+        pc = BorderedStokes(system.linearize(point, system.residual(point)))
+        self.assertIsNone(pc.border_inverse)
+        self.assertTrue(np.isfinite(pc(dual)).all())
+
+    @unittest.skipUnless(importlib.util.find_spec("petsc4py"), "petsc4py is optional")
+    def test_snes_solvers_and_stopping_reasons(self):
+        from petsc4py import PETSc
+
+        eq = self.eq
+        root = np.r_[eq.ref, 0.0, 1.0]
+        predictor = root + np.random.default_rng(15).normal(size=root.size) * 0.002
+        predictor[-1] = 1
+        normal = np.zeros_like(predictor)
+        normal[-1] = 1
+        system = CorrectorSystem(eq, predictor, normal, False)
+        for method, pc in [
+            ("newtonls", "none"),
+            ("newtonls", "bordered"),
+            ("newtontr", "bordered"),
+        ]:
+            found, counts, converged, info = petsc_correct(
+                system, 1e-9, 8, 40, method=method, preconditioner=pc
+            )
+            self.assertTrue(converged, info)
+            self.assertEqual((info["snes"], info["pc"]), (method, pc))
+            self.assertEqual(info["reason"], "CONVERGED_FNORM_ABS")
+            self.assertTrue(all(i > 0 for i in counts))
+            np.testing.assert_allclose(found, root, atol=2e-7)
+        # A native positive stopping reason can still miss the requested equation tolerance.
+        opts = PETSc.Options()
+        name = "orbit_snes_rtol"
+        prior = opts.getString(name, None) if opts.hasName(name) else None
+        try:
+            opts[name] = "0.99"
+            _, _, ok, info = petsc_correct(system, 1e-11, 8, 40)
+            self.assertEqual(info["reason"], "CONVERGED_FNORM_RELATIVE")
+            self.assertFalse(ok)
+            self.assertGreater(info["final_residual_norm"], 1e-11)
+        finally:
+            if prior is None:
+                del opts[name]
+            else:
+                opts[name] = prior
+
     def test_lift_preserves_field_and_projection(self):
         fine = Basis(3, 3, 2, 2)
         rich = OrbitSpace(fine, 72, self.device)
@@ -199,9 +294,21 @@ class SimilarityTest(unittest.TestCase):
         self.assertLess(cond, 1e4)
 
     def test_continue_restart_and_deflated_search(self):
+        self.check_continue_restart_and_deflated_search("scipy")
+
+    @unittest.skipUnless(importlib.util.find_spec("petsc4py"), "petsc4py is optional")
+    def test_snes_continue_restart_and_deflated_search(self):
+        self.check_continue_restart_and_deflated_search("petsc")
+
+    def check_continue_restart_and_deflated_search(self, solver):
         with tempfile.TemporaryDirectory() as d:
             root = Path(d)
-            common = ["--device", "gpu" if self.device == "cuda" else "cpu"]
+            common = [
+                "--device",
+                "gpu" if self.device == "cuda" else "cpu",
+                "--solver",
+                solver,
+            ]
 
             def search(path, options):
                 opts = parser().parse_args(
@@ -250,6 +357,14 @@ class SimilarityTest(unittest.TestCase):
             self.assertEqual(direct["current"]["forcing"], 0.0)
             self.assertGreater(direct["current"]["relative_spiral"], 0.05)
             self.assertNotEqual(direct["current"]["period"], 0.36)
+            if solver == "petsc":
+                self.assertEqual(
+                    first["petsc_correctors"][-1]["reason"], "CONVERGED_FNORM_ABS"
+                )
+                self.assertEqual(
+                    direct["petsc_correctors"][-1]["reason"], "DIVERGED_MAX_IT"
+                )
+                self.assertTrue(direct["direct_ksp_iterations"])
 
     def test_checkpoint_and_native_replay(self):
         from dataclasses import asdict

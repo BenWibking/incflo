@@ -18,7 +18,12 @@ if [[ ${1:-} == --replay ]]; then
 fi
 driver="$PWD/src/test_no_eb_3d/solve_similarity_orbit.py"
 out="$PWD/similarity-$SLURM_JOB_ID-${SLURM_RESTART_COUNT:-0}"
-run=(srun --kill-on-bad-exit=1 --ntasks=1 --gpus-per-task=1 --gpu-bind=closest --cpu-bind=cores python3)
+py=(python3)
+envdir=${DSS_PETSC_ENV:-"$PWD/snes-env"}
+if [[ -x $envdir/bin/python ]]; then
+    py=(pytorch-exec "$envdir/bin/python")
+fi
+run=(srun --kill-on-bad-exit=1 --ntasks=1 --gpus-per-task=1 --gpu-bind=closest --cpu-bind=cores "${py[@]}")
 "${run[@]}" "$driver" search --out "$out" --device gpu "$@"
 "${run[@]}" "$driver" audit "$out/orbit.npz" --device gpu --grids 128 160 192 --out "$out/audit.json"
 if [[ -n $replay_exe ]]; then
