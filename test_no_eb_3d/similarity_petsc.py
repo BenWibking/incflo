@@ -41,8 +41,11 @@ class BorderedStokes:
 
     def field_inverse(self, rhs):
         parts = []
-        for n, (block, c) in enumerate(
-            zip(self.blocks, self.basis.coefficients(rhs), strict=True)
+        frequencies = getattr(
+            self.basis, "block_frequencies", range(self.basis.temporal + 1)
+        )
+        for n, block, c in zip(
+            frequencies, self.blocks, self.basis.coefficients(rhs), strict=True
         ):
             x = (block @ c[..., None])[..., 0]
             parts.append(x.real.ravel())
@@ -156,7 +159,7 @@ def petsc_correct(
         snes.setJacobian(shell.jacobian, matrix, matrix)
         snes.setTolerances(rtol=0, atol=tolerance, stol=0, max_it=iterations)
         ksp = snes.getKSP()
-        ksp.setType("gmres")
+        ksp.setType(getattr(system.eq.space, "krylov_type", "gmres"))
         ksp.setGMRESRestart(min(n, krylov))
         ksp.setTolerances(rtol=0.03, max_it=krylov)
         ksp.setPCSide(P.PC.Side.RIGHT)

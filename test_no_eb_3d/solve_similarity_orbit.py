@@ -12,7 +12,20 @@ from pathlib import Path
 import numpy as np
 import torch
 from scipy.sparse.linalg import LinearOperator, gmres
+from similarity_elements import PaperBasis, PaperSpace, lift_paper, sample_paper
 from similarity_galerkin import Basis, OrbitSpace, sample_cartesian, transfer
+
+
+def checkpoint_basis(config):
+    return (PaperBasis if config.get("discretization") == "paper" else Basis)(
+        **config["basis"]
+    )
+
+
+def make_space(basis, grid, device):
+    return (PaperSpace if isinstance(basis, PaperBasis) else OrbitSpace)(
+        basis, grid, device
+    )
 
 
 def host(a):
@@ -27,15 +40,17 @@ class PseudoTimePath:
     initial_g: float = 0.502
     initial_viscosity: float = 1.0
     initial_damping: float = 0.1
+    wave_force_power: int = 2
 
     def __post_init__(self):
         if not all(math.isfinite(v) for v in asdict(self).values()) or not (
             self.decay_time > 0
             and self.initial_viscosity > 0
             and self.initial_damping >= 0
+            and self.wave_force_power in (1, 2)
         ):
             raise ValueError(
-                "Invalid pseudo-time decay scale, dilation, viscosity or damping"
+                "Invalid pseudo-time scale, dilation, viscosity, damping or wave force power"
             )
 
     def parameters(self, strength):
@@ -73,12 +88,18 @@ class OrbitEquation:
         self.linear_condition = max(
             float(torch.linalg.cond(f[-1]).max()) for f in factors
         )
-        if not self.linear_condition < 1 / np.finfo(float).eps:
+        if isinstance(space, PaperSpace):
+            self.inv = space.linear_inverse(factors)
+            self.scaled_condition = max(b.condition for b in self.inv)
+        else:
+            self.scaled_condition = self.linear_condition
+        if not self.scaled_condition < 1 / np.finfo(float).eps:
             raise ValueError(
-                "The radial linear block is numerically singular; reduce its degree or use Jacobi modes"
+                "The linear Galerkin block is numerically singular at this resolution"
             )
         self.reference_linear = [host(f[-1]) for f in factors]
-        self.inv = space.linear_inverse(factors)
+        if not isinstance(space, PaperSpace):
+            self.inv = space.linear_inverse(factors)
         self.force = self.fluid(self.ref, 0.0)
         if path:
             axis = np.array([n == 0 and m == 0 for n, _, m, _, _, _ in space.labels])
@@ -88,7 +109,9 @@ class OrbitEquation:
 
     def set_strength(self, strength):
         self.family = self.path.parameters(strength)
-        self.force = self.axis_force + strength * self.wave_force
+        # OrbitEquation.residual multiplies this prefactor by the clock strength.
+        wave_weight = 1.0 if self.path.wave_force_power == 1 else strength
+        self.force = self.axis_force + wave_weight * self.wave_force
 
     def factors(self, period):
         return self.space.factors(period, **self.family)
@@ -122,7 +145,7 @@ class OrbitEquation:
                 )
             else:
                 target_raw = raw
-        return {
+        metrics = {
             "period": self.period * math.exp(y[-2]),
             "forcing": float(y[-1]),
             "projected_residual": float(np.linalg.norm(raw - y[-1] * self.force)),
@@ -136,6 +159,15 @@ class OrbitEquation:
             ),
             "phase_error": float(abs(self.phase @ (x - self.ref))),
         }
+        if isinstance(self.space, PaperSpace):
+            metrics.update(
+                self.space.strong_norm(
+                    self.space.tensor(self.scale * x),
+                    metrics["period"],
+                    self.space.pressure_enrichment,
+                )
+            )
+        return metrics
 
 
 class OrbitJacobian:
@@ -332,7 +364,7 @@ def checkpoint(path, config, seed, y, previous, step, accepted):
         path,
         lambda f: np.savez(
             f,
-            schema=2,
+            schema=3 if config.get("discretization") == "paper" else 2,
             config=json.dumps(config),
             seed=seed,
             state=y,
@@ -345,16 +377,19 @@ def checkpoint(path, config, seed, y, previous, step, accepted):
 
 def load_checkpoint(path):
     with np.load(path, allow_pickle=False) as a:
-        if int(a["schema"]) not in (1, 2):
+        schema = int(a["schema"])
+        if schema not in (1, 2, 3):
             raise ValueError("Unsupported orbit checkpoint")
         cfg = json.loads(str(a["config"]))
-        if int(a["schema"]) == 1:
+        family = cfg.get("discretization", "spherical")
+        if family != ("paper" if schema == 3 else "spherical"):
+            raise ValueError(
+                "Checkpoint schema does not match its velocity representation"
+            )
+        if schema == 1:
             cfg["basis"].setdefault("radial_family", "legendre")
-        basis = Basis(**cfg["basis"])
-        count = sum(
-            2 * len(basis.modes(n)) * basis.radial * (2 if n else 1)
-            for n in range(basis.temporal + 1)
-        )
+        basis = checkpoint_basis(cfg)
+        count = len(basis.labels())
         seed, state, prev = (a[k].copy() for k in ("seed", "state", "previous"))
         step, accepted = float(a["step"]), int(a["accepted"])
         if (
@@ -388,7 +423,6 @@ def run_search(args):
     use_ptc = args.pseudo_transient or saved_path is not None
     requested_step = args.step
     args.step = 0.2 if args.step is None else args.step
-    args.solver = args.solver or ("petsc" if use_ptc else "scipy")
     path_values = {k: getattr(args, "ptc_" + k) for k in asdict(PseudoTimePath())}
     supplied = {k: v for k, v in path_values.items() if v is not None}
     if not use_ptc and (supplied or args.ptc_max_step is not None):
@@ -404,7 +438,7 @@ def run_search(args):
                 "Use --lift with a Newton checkpoint to initialize a new pseudo-time path"
             )
         path = PseudoTimePath(**{**(saved_path or {}), **supplied})
-        if saved_path is not None and asdict(path) != saved_path:
+        if saved_path is not None and path != PseudoTimePath(**saved_path):
             raise ValueError(
                 "Use --lift to change the physics of a saved pseudo-time path"
             )
@@ -414,13 +448,58 @@ def run_search(args):
             raise ValueError(
                 "The maximum pseudo-time step must be finite and at least --min-step"
             )
-    original = Basis(**source[0]["basis"]) if source else Basis()
-    basis = Basis(
+    original = checkpoint_basis(source[0]) if source else None
+    legacy_options = any(
+        getattr(args, k) is not None for k in ("radial", "degrees", "radial_family")
+    )
+    paper_options = any(
+        getattr(args, k) is not None
+        for k in (
+            "degree",
+            "sigma_breaks",
+            "eta_breaks",
+            "cell_degrees",
+            "pressure_enrichment",
+            "h_tol",
+        )
+    )
+    family = args.discretization
+    if family is None:
+        if source:
+            family = source[0].get("discretization", "spherical")
+        else:
+            family = "spherical" if legacy_options else "paper"
+    paper = family == "paper"
+    if (paper and legacy_options) or (not paper and paper_options):
+        raise ValueError(
+            "The requested basis options belong to different discretizations"
+        )
+    prototype = PaperBasis() if paper else Basis()
+    if original is not None and type(original) is not type(prototype):
+        raise ValueError(
+            "Checkpoints store distinct velocity representations. Start a fresh search to change family."
+        )
+    if args.cell_degrees is not None:
+        args.cell_degrees = json.loads(args.cell_degrees.read_text())
+    basis = type(prototype)(
         **{
             k: getattr(args, k) if getattr(args, k) is not None else v
-            for k, v in asdict(original).items()
+            for k, v in asdict(original or prototype).items()
         }
     )
+    args.solver = args.solver or ("petsc" if use_ptc or paper else "scipy")
+    if paper:
+        old = source[0] if source else {}
+        h_tol = args.h_tol if args.h_tol is not None else old.get("h_tol", args.tol)
+        enrichment = (
+            args.pressure_enrichment
+            if args.pressure_enrichment is not None
+            else old.get("pressure_enrichment", 1)
+        )
+        if not 0 < h_tol < math.inf or enrichment < 0:
+            raise ValueError(
+                "Supply a finite positive absolute H tolerance and nonnegative pressure enrichment"
+            )
     args.grid = (
         args.grid if args.grid is not None else (source[0]["grid"] if source else 128)
     )
@@ -446,7 +525,7 @@ def run_search(args):
         cfg, seed, y, previous, step, accepted = source
         if args.grid != cfg["grid"] or basis != original:
             raise ValueError("Use --lift to continue on a different grid or basis")
-        space = OrbitSpace(Basis(**cfg["basis"]), args.grid, dev)
+        space = make_space(basis, args.grid, dev)
         if use_ptc:
             if requested_step is not None:
                 step = requested_step
@@ -460,7 +539,7 @@ def run_search(args):
             or not 0 <= args.jitter < np.inf
         ):
             raise ValueError("Invalid seed amplitudes or period")
-        space = OrbitSpace(basis, args.grid, dev)
+        space = make_space(basis, args.grid, dev)
         cfg = {
             "basis": asdict(basis),
             "grid": args.grid,
@@ -474,25 +553,32 @@ def run_search(args):
         seed = space.seed(args.amplitude, args.wave, args.seed, args.jitter)
         if args.lift:
             old_cfg, old_seed, old_y, *_ = source
-            old_basis = Basis(**old_cfg["basis"])
-            if (old_basis.radius, old_basis.phase_radius) != (
-                basis.radius,
-                basis.phase_radius,
-            ):
-                raise ValueError(
-                    "A modal lift requires the original radial map and phase radius"
+            old_basis = checkpoint_basis(old_cfg)
+            if paper:
+                seed = lift_paper(
+                    old_y[:-2] * np.linalg.norm(old_seed), old_basis, basis
                 )
-            if basis.radial_family != old_basis.radial_family:
-                raise ValueError(
-                    "A coefficient lift requires the same radial polynomial family"
+            else:
+                if (old_basis.radius, old_basis.phase_radius) != (
+                    basis.radius,
+                    basis.phase_radius,
+                ):
+                    raise ValueError(
+                        "A modal lift requires the original radial map and phase radius"
+                    )
+                if basis.radial_family != old_basis.radial_family:
+                    raise ValueError(
+                        "A coefficient lift requires the same radial polynomial family"
+                    )
+                if not set(old_basis.labels()).issubset(space.labels):
+                    raise ValueError(
+                        "A modal lift must retain every original harmonic and radial degree"
+                    )
+                seed = transfer(
+                    old_y[:-2] * np.linalg.norm(old_seed),
+                    old_basis.labels(),
+                    space.labels,
                 )
-            if not set(old_basis.labels()).issubset(space.labels):
-                raise ValueError(
-                    "A modal lift must retain every original harmonic and radial degree"
-                )
-            seed = transfer(
-                old_y[:-2] * np.linalg.norm(old_seed), old_basis.labels(), space.labels
-            )
             cfg["period"] = old_cfg["period"] * math.exp(old_y[-2])
             cfg["lifted_from"] = str(args.lift)
             for unused in ("amplitude", "wave", "random_seed", "jitter"):
@@ -519,6 +605,9 @@ def run_search(args):
         ):
             raise ValueError("Inconsistent pseudo-time clock in checkpoint")
         step = min(step, args.ptc_max_step)
+    if paper:
+        cfg.update(discretization="paper", pressure_enrichment=enrichment, h_tol=h_tol)
+        space.pressure_enrichment = enrichment
     eq = OrbitEquation(space, seed, cfg["period"], path)
     if path:
         eq.set_strength(y[-1])
@@ -528,7 +617,10 @@ def run_search(args):
         "config": cfg,
         "unknown_field_coefficients": len(seed),
         "max_linear_block_condition": eq.linear_condition,
-        "quadrature": [args.grid, args.grid, space.wedge * 19],
+        "quadrature": [
+            *(space.weight.shape if paper else (args.grid, args.grid)),
+            space.wedge * 19,
+        ],
         "phase_nodes": space.nt,
         "device": dev,
         "hardware": torch.cuda.get_device_name() if dev == "cuda" else "CPU",
@@ -537,6 +629,8 @@ def run_search(args):
         "stages": [],
         "rejected_steps": 0,
     }
+    if paper:
+        report["max_equilibrated_block_condition"] = eq.scaled_condition
     initial_accepted = accepted
 
     def correct_point(predictor, normal, deflate, shift=0.0):
@@ -566,11 +660,34 @@ def run_search(args):
         return candidate, counts, converged
 
     def save(status, metrics=None):
+        if metrics is None:
+            metrics = eq.metrics(y)
+        if (
+            paper
+            and min(metrics["relative_spiral"], metrics["relative_field"])
+            >= args.min_spiral
+        ):
+            best = report.get("best_by_h")
+            if best is None or metrics["residual_h"] < best["residual_h"]:
+                report["best_by_h"] = {
+                    "stage": accepted,
+                    "forcing": float(y[-1]),
+                    "residual_h": metrics["residual_h"],
+                }
+                checkpoint(
+                    args.out / "best-h.npz", cfg, seed, y, previous, step, accepted
+                )
+        if paper and status == "unforced_projected_root":
+            status = (
+                "unforced_h_tolerance_met"
+                if metrics["residual_h"] <= h_tol
+                else "projected_root_needs_refinement"
+            )
         report.update(
             status=status,
             accepted=accepted,
             elapsed_seconds=time.monotonic() - start,
-            current=eq.metrics(y) if metrics is None else metrics,
+            current=metrics,
         )
         checkpoint(args.out / "orbit.npz", cfg, seed, y, previous, step, accepted)
         write_json(args.out / "search.json", report)
@@ -781,12 +898,38 @@ def run_search(args):
 
 def audit(args):
     cfg, seed, y, *_ = load_checkpoint(args.checkpoint)
-    basis = Basis(**cfg["basis"])
+    basis = checkpoint_basis(cfg)
     old_labels = None
     device = backend(args.device)
     grids = sorted(set(args.grids))
     if not grids or min(grids) < 128:
         raise ValueError("Use audit grids of at least 128")
+    if isinstance(basis, PaperBasis):
+        period = cfg["period"] * math.exp(y[-2])
+        rows = []
+        base = cfg["pressure_enrichment"]
+        for grid in grids:
+            sp = PaperSpace(basis, grid, device)
+            coeff = sp.tensor(np.linalg.norm(seed) * y[:-2])
+            for enrich in [base, base + 1] if grid == max(grids) else [base]:
+                rows.append(
+                    dict(
+                        grid=grid,
+                        quadrature=[*sp.weight.shape, 19 * sp.wedge],
+                        phase_nodes=sp.nt,
+                        **sp.strong_norm(coeff, period, enrich, detail=True),
+                    )
+                )
+        report = {
+            "checkpoint": str(args.checkpoint),
+            "discretization": "paper",
+            "forcing": float(y[-1]),
+            "period": period,
+            "measurements": rows,
+        }
+        write_json(args.out, report)
+        print(json.dumps(report, indent=2))
+        return
     rows = []
     for grid, enrich in [(g, False) for g in grids] + [(max(grids), True)]:
         test = (
@@ -845,7 +988,8 @@ def audit(args):
 
 def export_replay(args):
     cfg, seed, y, *_ = load_checkpoint(args.checkpoint)
-    basis = Basis(**cfg["basis"])
+    basis = checkpoint_basis(cfg)
+    sample = sample_paper if isinstance(basis, PaperBasis) else sample_cartesian
     period = cfg["period"] * math.exp(y[-2])
     end = -math.expm1(-period)
     n = args.grid
@@ -870,7 +1014,7 @@ def export_replay(args):
         u = np.memmap(f.name, mode="r+", dtype=np.float64, shape=shape)
         for iz, z in enumerate(axis):
             points = np.stack((xx, yy, np.full_like(xx, z)), axis=-1)
-            plane = sample_cartesian(basis, coeff, period, args.phase, points)
+            plane = sample(basis, coeff, period, args.phase, points)
             u[:, iz] = plane.T.reshape(3, n, n)
         u.flush()
 
@@ -937,6 +1081,44 @@ def parser():
         type=Path,
         help="Start a finer continuation from a saved field and period",
     )
+    s.add_argument(
+        "--discretization",
+        choices=("paper", "spherical"),
+        help="New searches use Appendix C.2 elements by default. Legacy radial options select spherical.",
+    )
+    s.add_argument(
+        "--element-degree",
+        dest="degree",
+        type=int,
+        help="Polynomial degree per rectangle (default 4)",
+    )
+    s.add_argument(
+        "--sigma-breaks",
+        type=float,
+        nargs="+",
+        help="Compact radius knots including 0 and 1",
+    )
+    s.add_argument(
+        "--eta-breaks",
+        type=float,
+        nargs="+",
+        help="Northern meridian knots including 0 and 1",
+    )
+    s.add_argument(
+        "--cell-degrees",
+        type=Path,
+        help="JSON array of per-harmonic, per-rectangle degree overrides",
+    )
+    s.add_argument(
+        "--pressure-enrichment",
+        type=int,
+        help="Pressure degree minus velocity polynomial degree (default 1)",
+    )
+    s.add_argument(
+        "--h-tol",
+        type=float,
+        help="Absolute unforced pressure-fitted H tolerance (default --tol)",
+    )
     s.add_argument("--grid", type=int)
     s.add_argument("--radial", type=int)
     s.add_argument("--degrees", type=int)
@@ -979,6 +1161,12 @@ def parser():
         help="Initial damping of non-axisymmetric modes (default 0.1)",
     )
     s.add_argument(
+        "--ptc-wave-force-power",
+        type=int,
+        choices=(1, 2),
+        help="Exponent of the wave-induced forcing, linear (1) or quadratic (2, default)",
+    )
+    s.add_argument(
         "--ptc-max-step",
         type=float,
         help="Largest backward Euler pseudo-time step (default 100)",
@@ -993,7 +1181,7 @@ def parser():
     s.add_argument(
         "--solver",
         choices=("scipy", "petsc"),
-        help="Default is PETSc for pseudo-time and SciPy otherwise",
+        help="Default is PETSc for elements and pseudo-time, SciPy for other searches",
     )
     s.add_argument("--snes-type", help="PETSc SNES method (default newtonls)")
     s.add_argument(

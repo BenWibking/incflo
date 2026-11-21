@@ -7,6 +7,7 @@ import os
 import sys
 import tempfile
 import unittest
+from dataclasses import replace
 from pathlib import Path
 
 import numpy as np
@@ -399,6 +400,21 @@ class SimilarityTest(unittest.TestCase):
         np.testing.assert_allclose(
             eq.fluid(eq.ref, 0.0), self.eq.fluid(eq.ref, 0.0), atol=1e-14
         )
+        for power in (1, 2):
+            comparison = OrbitEquation(
+                self.space,
+                self.seed,
+                self.period,
+                replace(path, wave_force_power=power),
+            )
+            for strength in (0.0, 0.25, 1.0):
+                comparison.set_strength(strength)
+                np.testing.assert_allclose(
+                    strength * comparison.force,
+                    strength * eq.axis_force + strength**power * eq.wave_force,
+                    rtol=1e-14,
+                    atol=1e-14,
+                )
         log_strength = 0.0
         for _ in range(80):
             log_strength = path.advance_clock(log_strength, path.decay_time)
