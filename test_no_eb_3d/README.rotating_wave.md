@@ -1,4 +1,4 @@
-# Axisymmetric base flow and upper-half-space rotating waves
+# Axisymmetric base flow and rotating waves
 
 ## Equilibrate the axisymmetric flow
 
@@ -53,6 +53,41 @@ sbatch -A YOUR_PROJECT-gpu -p gpu-highmem "$driver" axisymmetric --audit-only "$
 At physical torque amplitude 118.45044, the degree-six field had inward radial velocity −51.33 at `(r,z)=(30,0)` and axial velocity +140.44 at `(0,24)`. Its independent 256-by-256 meridional check with degree-nine pressure measured an imbalance of 1.215% of the applied force. Relative velocity changes from the degree-five field were 3.71% over the observed region and 4.27% in the core-weighted norm. The drive was 44.1% of the sum of the pressure-projected linear and nonlinear term norms. This supplies a forced equilibrium for the modeled torque. The authors’ intermediate axisymmetric field and its force are unavailable in the public release.
 
 At half that torque, the lower-swirl state had weighted mean swirl 43.92 and a 0.171% momentum imbalance. Its velocity changed by 1.13% in the observed region from degree five to six. On the same degree-six mesh a downward continuation also produced a larger-swirl trial, with mean 66.18 and 2.33% imbalance. At degree five both directions returned to mean 43.78. The larger-swirl branch remains unconfirmed.
+
+## Probe waves on the full-space equilibrium
+
+Section C.3 of the paper adds finite-amplitude waves on the inflow layer at integer azimuthal wave numbers 14 through 20. The `probe` driver tests localized disturbances before a nonlinear solve. It fixes the axisymmetric equilibrium and its torque and evolves the linearized similarity equations for each Fourier mode in both hemispheres. Cubic divergence-free meridional elements join across the equator. Azimuthal integration for a single mode is exact.
+
+From the Setonix run directory with the source under `src/`, run
+
+```bash
+driver=src/test_no_eb_3d/setonix/rotating-wave.sbatch
+sbatch -A YOUR_PROJECT-gpu -p gpu-highmem "$driver" probe --mesh coarse --grid 128
+sbatch -A YOUR_PROJECT-gpu -p gpu-highmem "$driver" probe --mesh fine --grid 160
+sbatch -A YOUR_PROJECT-gpu -p gpu-highmem "$driver" probe --mesh finer --grid 192
+```
+
+The two trial packets are centered at cylindrical `r=40, z=6.5` and have independent radial and vertical polarizations. The azimuthal velocity closes the divergence constraint. Their position, widths, and localized far field are modeling choices. The matrix exponential advances the complete spatial Galerkin system through `--time 0.36` by default. For each mode the driver then finds the combination of the two initial packets with the largest final core velocity norm. The core norm is the square root of the velocity squared integrated with weight `(1 + |y|²/50²)⁻²`. A control advances that same input with the background flow set to zero.
+
+Each `mode-probe-JOB_ID-0/mNN.npz` holds complex spline coefficients at the start and end and the optimized initial polarization. The corresponding JSON records the energy-identity check, seed projection error, whole-space and core amplitude gains, and the endpoint overlap after optimal azimuthal rotation. An overlap of one means that the shape repeats up to rotation and an overall amplitude. The reported frequency follows the phase of successive snapshots and can include deformation. Rigid rotation at frequency `omega` would advance the pattern at `omega/m` radians per unit similarity time.
+
+With NumPy, SciPy, PyTorch, and Matplotlib in the solver environment, compare the saved fields on a common independent quadrature and plot the mode scan with
+
+```bash
+python3 src/test_no_eb_3d/compare_mode_probes.py mode-probe-COARSE_JOB_ID-0 \
+    mode-probe-FINE_JOB_ID-0 mode-probe-FINER_JOB_ID-0 --out mode-comparison
+```
+
+The `refined` mesh permits a fourth check on selected modes. Pass `probe --mesh refined --grid 320 --modes 14 19` to the batch script and `--modes 14 19 --grid 384` to the comparison script.
+
+On Setonix, the first three meshes ranked the packet gains in decreasing order from `m=14` to `m=20`. The fourth mesh used 2,124 complex velocity coefficients per mode and 323 by 338 meridional quadrature nodes. At similarity time 0.36 it gave
+
+| Mode | Core amplitude gain | Same input in zero flow | Whole-space amplitude gain | Initial-to-final overlap after rotation |
+| --- | ---: | ---: | ---: | ---: |
+| 14 | 1.0560 | 0.8962 | 0.8952 | 0.1133 |
+| 19 | 0.9541 | 0.8662 | 0.8144 | 0.0330 |
+
+The core energy centroid for mode 14 moved from cylindrical radius 39.7 to 28.3. Refinement from 932 to 2,124 coefficients changed the core amplitude gains by less than 0.004. The corresponding endpoint fields differed by 25% and 43% in the core velocity norm after alignment on the independent 391 by 390 quadrature. These measurements describe transient evolution for the two trial polarizations.
 
 ## Single rotating wave
 

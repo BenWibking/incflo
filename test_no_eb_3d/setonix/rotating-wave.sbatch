@@ -19,6 +19,8 @@ if [[ $mode == check ]]; then
     args=(-m unittest discover -s "$PWD/src/test_no_eb_3d" -p 'test_similarity*.py' -v)
 elif [[ $mode == axisymmetric ]]; then
     args=("$PWD/src/test_no_eb_3d/solve_axisymmetric.py" --out "$PWD/axisymmetric-$SLURM_JOB_ID-${SLURM_RESTART_COUNT:-0}" --device gpu "$@")
+elif [[ $mode == probe ]]; then
+    args=("$PWD/src/test_no_eb_3d/probe_rotating_modes.py" --out "$PWD/mode-probe-$SLURM_JOB_ID-${SLURM_RESTART_COUNT:-0}" --device gpu "$@")
 else
     args=("$driver" "$mode" --out "$PWD/wave-$SLURM_JOB_ID-${SLURM_RESTART_COUNT:-0}" --device gpu "$@")
 fi

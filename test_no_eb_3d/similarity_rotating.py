@@ -289,11 +289,11 @@ class WaveSpace:
             kappa,
         )
         sig, ws = gauss_elements(basis.sigma_breaks, grid)
-        eta, wa = gauss_elements(basis.eta_breaks, grid)
+        eta, wa = gauss_elements(basis.full_eta, grid)
         if (
             min(
                 len(sig) // (len(basis.sigma_breaks) - 1),
-                len(eta) // (len(basis.eta_breaks) - 1),
+                len(eta) // (len(basis.full_eta) - 1),
             )
             < basis.degree + 4
         ):
