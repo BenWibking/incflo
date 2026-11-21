@@ -17,6 +17,8 @@ if [[ $# -gt 0 ]]; then shift; fi
 if [[ $mode == check ]]; then
     export DSS_TEST_DEVICE=gpu
     args=(-m unittest discover -s "$PWD/src/test_no_eb_3d" -p 'test_similarity*.py' -v)
+elif [[ $mode == axisymmetric ]]; then
+    args=("$PWD/src/test_no_eb_3d/solve_axisymmetric.py" --out "$PWD/axisymmetric-$SLURM_JOB_ID-${SLURM_RESTART_COUNT:-0}" --device gpu "$@")
 else
     args=("$driver" "$mode" --out "$PWD/wave-$SLURM_JOB_ID-${SLURM_RESTART_COUNT:-0}" --device gpu "$@")
 fi

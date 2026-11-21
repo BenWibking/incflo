@@ -40,7 +40,7 @@ class WaveBasis:
             object.__setattr__(self, key, breaks(getattr(self, key)))
         if (
             self.degree < 3
-            or self.harmonics < 1
+            or self.harmonics < 0
             or not all(0 < x < math.inf for x in (self.radius, self.phase_radius))
         ):
             raise ValueError(
@@ -362,7 +362,7 @@ class WaveSpace:
             "residual_h": h,
             "relative_h": h / max(math.sqrt(linear2) + math.sqrt(nonlinear2), 1e-300),
             "outside_h": math.sqrt(outside2),
-            "wave_rms": self.wave_rms(U[1]),
+            "wave_rms": self.wave_rms(U[1]) if len(U) > 1 else 0.0,
         }
 
     def wave_rms(self, U1):
@@ -454,6 +454,8 @@ class RotatingWave:
     """Fixed physical test functions and a trial space with the current far-field behavior."""
 
     def __init__(self, space, g, omega, coeff, amplitude=None):
+        if space.basis.harmonics < 1:
+            raise ValueError("A rotating wave requires a nonzero angular harmonic")
         self.space = space
         geo = WaveGeometry(space, space.kappa, g, omega)
         self.geo = geo
