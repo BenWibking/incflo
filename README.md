@@ -46,6 +46,8 @@ The [one-cycle search guide](test_no_eb_3d/README.dss_search.md) covers the Enzy
 adjoint, parallel Richardson-guided GPU optimization on 128³, 160³ and 192³
 with Optimas on Setonix, and a Bash helper for downloading the best field's vorticity profile.
 
+A GPU solver also searches directly for a time-periodic velocity field in similarity coordinates, including its period and far-field tail. [Direct orbit solver and Setonix commands](test_no_eb_3d/README.similarity_orbit.md)
+
 # Contributing
 
 We welcome contributions in the form of pull-requests from anyone. For more

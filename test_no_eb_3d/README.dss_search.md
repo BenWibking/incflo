@@ -2,6 +2,8 @@
 
 The harness minimizes the one-period return error of a nonzero initial velocity field in the 3D incompressible solver. A run uses the native incflo MOL predictor and corrector, constant unit density and viscosity, periodic boundaries, a single fixed grid and fixed time steps. Each independent search uses one CPU rank or one AMD GPU die. This checkout generates a modeled 19-fold seed with a compact envelope. The authors describe a velocity tail proportional to `1/r`. Their public release omits the numerical profile coefficients. [Authors' public materials](https://github.com/tristanbuckmaster/navier-stokes)
 
+The GPU space-time Galerkin solver searches for a periodic orbit directly in similarity coordinates and exports fields for this harness to replay. [Direct orbit solver](README.similarity_orbit.md)
+
 ## Build with Enzyme on a CPU
 
 The commands below run from a working directory containing this checkout in `src/`. Use upstream LLVM Clang and a ClangEnzyme plugin compiled for the same major LLVM version. The tested generator used LLVM 23.1.6 and Enzyme 0.0.311. On a Mac, Homebrew supplies both with `brew install llvm enzyme cmake ninja`. Use Python 3.10 or later with NumPy and SciPy, for example in a virtual environment with `python3 -m pip install numpy scipy`. The optional `pack` command also uses yt.
