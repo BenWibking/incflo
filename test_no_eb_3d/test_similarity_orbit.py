@@ -17,6 +17,7 @@ from similarity_petsc import BorderedStokes, petsc_correct
 from solve_similarity_orbit import (
     CorrectorSystem,
     OrbitEquation,
+    PseudoTimePath,
     backend,
     checkpoint,
     correct,
@@ -101,6 +102,17 @@ class SimilarityTest(unittest.TestCase):
         lhs = (
             sp.residual(sp.tensor(self.seed), sp.factors(self.period)).cpu().numpy() @ t
         )
+        g, nu, gamma = 0.502, 1.3, 0.2
+        family_lhs = (
+            sp.residual(
+                sp.tensor(self.seed),
+                sp.factors(self.period, dilation=g, viscosity=nu, damping=gamma),
+            )
+            .cpu()
+            .numpy()
+            @ t
+        )
+        nonaxis = np.array([m != 0 for _, _, m, *_ in sp.labels])
         mu, w = roots_legendre(sp.grid)
         a = np.pi * (mu + 1) / 4
         radius = self.basis.radius * np.tan(a)
@@ -115,7 +127,7 @@ class SimilarityTest(unittest.TestCase):
             wr[:, None, None] * w[None, :, None], rr.shape
         ).ravel() / (sp.nt * sp.wedge)
         h = np.log1p((rr.ravel() / self.basis.phase_radius) ** 2)
-        integral = 0.0
+        integral = family_integral = 0.0
         eps = 2e-6
         for i in range(sp.nt):
             phase = i / sp.nt + h / self.period
@@ -133,7 +145,15 @@ class SimilarityTest(unittest.TestCase):
                 self.basis, t, self.period, phase, pts, "curl", tail=3
             )
             integral += weight @ np.sum(test * f + test_curl * curl, axis=1)
+            wave = sample_cartesian(
+                self.basis, self.seed * nonaxis, self.period, phase, pts
+            )
+            family = f + (g - 0.5) * (dilation - v) + gamma * wave
+            family_integral += weight @ np.sum(
+                test * family + nu * test_curl * curl, axis=1
+            )
         np.testing.assert_allclose(lhs, integral, atol=1e-7, rtol=8e-8)
+        np.testing.assert_allclose(family_lhs, family_integral, atol=1e-7, rtol=8e-8)
 
     def test_bordered_jacobian_and_newton(self):
         eq = self.eq
@@ -158,12 +178,14 @@ class SimilarityTest(unittest.TestCase):
         rng = np.random.default_rng(125)
         point = np.r_[eq.ref, 0.18, 0.4]
         direction, dual, normal = rng.normal(size=(3, len(point)))
-        for deflate in (False, True):
+        for deflate, shift in [(False, 0.0), (True, 0.0), (False, 7.0)]:
             if deflate:
                 normal = np.zeros_like(point)
                 normal[-1] = 1.0
                 point[-1] = 0.0
-            system = CorrectorSystem(eq, point, normal, deflate)
+            predictor = point.copy()
+            predictor[:-2] += 0.001 * dual[:-2]
+            system = CorrectorSystem(eq, predictor, normal, deflate, shift)
             jac = system.linearize(point, system.residual(point))
             eps = 2e-6
             fd = (
@@ -191,7 +213,9 @@ class SimilarityTest(unittest.TestCase):
             field = space.scale_residual(space.pack(blocks), eq.inv).cpu().numpy()
             field += jac.orbit.period_column * direction[-2] - eq.force * direction[-1]
             rhs = np.r_[
-                jac.weight * field + jac.fluid_residual * (jac.derivative @ direction),
+                jac.weight * field
+                + jac.fluid_residual * (jac.derivative @ direction)
+                + shift * direction[:-2],
                 eq.phase @ direction[:-2],
                 normal @ direction,
             ]
@@ -365,6 +389,119 @@ class SimilarityTest(unittest.TestCase):
                     direct["petsc_correctors"][-1]["reason"], "DIVERGED_MAX_IT"
                 )
                 self.assertTrue(direct["direct_ksp_iterations"])
+
+    def test_implicit_pseudo_time_and_restart(self):
+        path = PseudoTimePath(decay_time=0.7, initial_viscosity=1.2)
+        eq = OrbitEquation(self.space, self.seed, self.period, path)
+        start = np.r_[eq.ref, 0.0, 1.0]
+        np.testing.assert_allclose(eq.residual(start), 0.0, atol=1e-14)
+        eq.set_strength(0.0)
+        np.testing.assert_allclose(
+            eq.fluid(eq.ref, 0.0), self.eq.fluid(eq.ref, 0.0), atol=1e-14
+        )
+        log_strength = 0.0
+        for _ in range(80):
+            log_strength = path.advance_clock(log_strength, path.decay_time)
+        self.assertAlmostEqual(math.exp(log_strength) * 2**80, 1.0, places=12)
+
+        with tempfile.TemporaryDirectory() as d:
+            d = Path(d)
+            fresh = [
+                "--pseudo-transient",
+                "--radial",
+                "2",
+                "--degrees",
+                "2",
+                "--azimuthal",
+                "1",
+                "--temporal",
+                "1",
+                "--ptc-decay-time",
+                "0.7",
+                "--ptc-initial-viscosity",
+                "1.2",
+                "--step",
+                "0.1",
+            ]
+
+            def search(name, options):
+                args = parser().parse_args(
+                    [
+                        "search",
+                        "--out",
+                        str(d / name),
+                        "--device",
+                        "gpu" if self.device == "cuda" else "cpu",
+                        "--solver",
+                        "petsc" if importlib.util.find_spec("petsc4py") else "scipy",
+                        "--newton",
+                        "10",
+                        "--krylov",
+                        "50",
+                        *options,
+                    ]
+                )
+                run_search(args)
+                return json.loads((d / name / "search.json").read_text())
+
+            one = search("one", [*fresh, "--max-stages", "1"])
+            two = search(
+                "resumed", ["--restart", str(d / "one/orbit.npz"), "--max-stages", "1"]
+            )
+            together = search("two", [*fresh, "--max-stages", "2"])
+            self.assertEqual(two["status"], "pseudo_time_budget_reached")
+            self.assertEqual(two["accepted"], 2)
+            cfg, seed, y, old, _, _ = load_checkpoint(d / "resumed/orbit.npz")
+            np.testing.assert_allclose(
+                y, load_checkpoint(d / "two/orbit.npz")[2], rtol=2e-12, atol=2e-12
+            )
+            dt = two["stages"][-1]["dt"]
+            self.assertAlmostEqual(
+                (y[-1] - old[-1]) / dt, -y[-1] / path.decay_time, places=13
+            )
+            self.assertAlmostEqual(
+                cfg["pseudo_time"], one["config"]["pseudo_time"] + dt
+            )
+            self.assertAlmostEqual(cfg["log_forcing"], math.log(y[-1]))
+            self.assertEqual(
+                two["config"]["pseudo_time"], together["config"]["pseudo_time"]
+            )
+            phys = OrbitSpace(Basis(**cfg["basis"]), cfg["grid"], self.device)
+            step_eq = OrbitEquation(phys, seed, cfg["period"], path)
+            step_eq.set_strength(y[-1])
+            fluid = step_eq.residual(y)[:-1]
+            np.testing.assert_allclose((y[:-2] - old[:-2]) / dt + fluid, 0, atol=1e-7)
+            self.assertLess(two["stages"][-1]["implicit_residual"], 1e-7)
+            self.assertGreater(two["current"]["unforced_relative_defect"], 0.1)
+            self.assertGreater(np.linalg.norm(fluid), 0.01)
+            diagnostic = search(
+                "crossing", [*fresh, "--max-stages", "2", "--min-spiral", "0.9999"]
+            )
+            self.assertEqual(diagnostic["accepted"], 2)
+            self.assertIn("first_below_amplitude_floor", diagnostic)
+            # Large finite steps still give a positive forcing in the log-space clock.
+            cutoff = PseudoTimePath().advance_clock(0.0, 1e200)
+            self.assertTrue(math.isfinite(cutoff) and math.exp(cutoff) > 0)
+            failed = search(
+                "failed",
+                [
+                    *fresh,
+                    "--max-stages",
+                    "1",
+                    "--step",
+                    "0.4",
+                    "--min-step",
+                    "0.4",
+                    "--tol",
+                    "1e-12",
+                    "--newton",
+                    "1",
+                ],
+            )
+            self.assertEqual(failed["status"], "pseudo_time_stalled")
+            self.assertEqual(failed["accepted"], 0)
+            self.assertEqual(failed["config"]["pseudo_time"], 0)
+            self.assertEqual(failed["current"]["forcing"], 1.0)
 
     def test_checkpoint_and_native_replay(self):
         from dataclasses import asdict

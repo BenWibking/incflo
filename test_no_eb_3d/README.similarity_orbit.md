@@ -1,6 +1,6 @@
 # Searching for a periodic orbit in similarity coordinates
 
-`solve_similarity_orbit.py` solves for a three-dimensional velocity field over a full similarity period and for the period itself. It uses a space-time Galerkin discretization on all of space. PyTorch evaluates the field, nonlinear terms and linearized operator in double precision on one GPU. The default corrector uses SciPy Newton–GMRES. The optional PETSc SNES backend supplies line-search and trust-region Newton methods. The existing incflo executable can replay the resulting initial field independently in physical time.
+`solve_similarity_orbit.py` solves for a three-dimensional velocity field over a full similarity period and for the period itself. It uses a space-time Galerkin discretization on all of space. PyTorch evaluates the field, nonlinear terms and linearized operator in double precision on one GPU. Arclength continuation defaults to SciPy Newton–GMRES. Implicit pseudo-time marching defaults to PETSc SNES. The PETSc backend supplies line-search and trust-region Newton methods. The existing incflo executable can replay the resulting initial field independently in physical time.
 
 ## Run on Setonix
 
@@ -58,6 +58,33 @@ sbatch -A YOUR_PROJECT-gpu src/test_no_eb_3d/setonix/similarity.sbatch \
 The residual always carries the reference radial Stokes–dilation inverse. PETSc's `--pc bordered` updates each radial inverse to the current period and solves a three-variable Schur complement for the period, forcing and inverse-square deflation derivative. It includes both scalar constraints. Velocity advection remains in the exact Jacobian action. A singular small border falls back to radial scaling for that linearization. `--pc none` gives a baseline with the same residual and the same right-GMRES stopping norm.
 
 Standard PETSc options use the prefix `orbit_`. For example, set `PETSC_OPTIONS='-orbit_ksp_rtol 0.01 -orbit_ksp_monitor_true_residual'` in the run environment to change and monitor the inner solve. The default inner relative tolerance is 0.03. `--newton` and `--krylov` set the default outer and inner iteration limits. Each SNES iteration prints the nonlinear residual and cumulative Krylov count. In `search.json`, `petsc_correctors` records each attempt's SNES and KSP termination reasons, residual history and border fallback count. The search also checks the actual augmented residual against `--tol` before accepting a corrector. [PETSc SNES manual](https://petsc.org/release/manual/snes/)
+
+## Implicit pseudo-transient continuation
+
+`search --pseudo-transient` evolves the entire space-time coefficient vector in an artificial time $\tau$. The Fourier phase $s/S$ still spans one similarity period at every $\tau$. Write $x$ for the normalized field coefficients, $S$ for the free period, and $\lambda$ for the scalar homotopy strength. The clock starts at $\lambda(0)=1$ and obeys $T\dot\lambda=-\lambda$, so the zero-forcing limit is at $\tau\to\infty$. The backward Euler equations for a step of length $h$ are
+
+$$
+\lambda_{n+1}=\frac{\lambda_n}{1+h/T},\qquad
+\frac{x_{n+1}-x_n}{h}+\widehat R(x_{n+1},S_{n+1};\lambda_{n+1})=0,\qquad
+p^\mathsf{T}(x_{n+1}-x_*)=0.
+$$
+
+Here $\widehat R$ is the forced weak similarity residual after the reference radial-block scaling. The artificial mass is the identity on those normalized coefficients. The phase condition is algebraic and determines the period. The driver solves the scalar backward Euler row analytically, evaluates all family parameters at the new strength, and solves the implicit field step with SNES. Its matrix-free Jacobian and radial preconditioner both include the $I/h$ field shift. The pseudo-time search uses the ordinary weak residual. Inverse-square deflation is specific to the direct Newton search.
+
+The modeled path uses the equation family in Appendix C.3 and the fixed 19-fold, full-space Galerkin basis. It varies $g=1/2+(g_0-1/2)\lambda$ and $\nu=1+(\nu_0-1)\lambda$, with damping $\gamma_0\lambda$ on non-axisymmetric velocity modes. Defaults are $T=1$, $g_0=0.502$, $\nu_0=1$, and $\gamma_0=0.1$. In weak coefficient space the forcing is $\lambda f_{\rm ax}+\lambda^2 f_{\rm w}$. The residual of the steady axisymmetric part of the seed defines $f_{\rm ax}$. The additional force $f_{\rm w}$ balances the finite-amplitude wave seed at $\lambda=1$ and decays faster. This gives a reproducible forced starting point. The authors also followed half-space rotating waves with a continuously variable azimuthal wave number and identified a second family that reached $g=1/2$. Their intermediate states and numerical forcing are unavailable in the public materials. [Paper, Appendix C.3](https://github.com/tristanbuckmaster/navier-stokes/blob/main/paper/finite-time-blow-up-navier-stokes.pdf)
+
+With the PETSc environment installed, the one-GPU Setonix command is
+
+```bash
+sbatch -A YOUR_PROJECT-gpu src/test_no_eb_3d/setonix/similarity.sbatch \
+    --replay build/incflo.ex --pseudo-transient \
+    --grid 160 --radial 9 --degrees 9 --azimuthal 4 --temporal 4 \
+    --seed 19002 --jitter 0.05 --step 0.1 --newton 10 --krylov 80 --max-stages 40
+```
+
+`--step` sets the initial pseudo-time step. A successful step using at most half the Newton budget (rounded up, minimum two iterations) grows the next step by 1.5, up to `--ptc-max-step`. A failed implicit solve halves the step and retries from the last accepted field and clock. `--restart` restores the adaptive step, accumulated pseudo-time, log forcing, seed and family parameters. `--lift` starts a new clock from an existing field.
+
+`stages[].implicit_residual` measures the backward Euler equation. `projected_residual` measures the instantaneous forced equation with the time derivative removed. `unforced_relative_defect` always evaluates the physical target at $g=1/2,\nu=1,F=0$ and divides its scaled residual by the current field norm. The march records the first crossing below `--min-spiral` and continues. A nonzero projected root requires sufficiently small forcing, absolute target residual and phase error, relative target defect, and sufficient field and spiral amplitude. A small absolute residual and a field or spiral below the amplitude floor at the clock tolerance are labeled `limit_below_amplitude_floor`. The independent audit and incflo replay also use the physical target equations.
 
 ## Equation and field representation
 
@@ -143,3 +170,5 @@ Job `53520094` compared PETSc 3.26.1 line-search Newton on the same MI250X die, 
 | Checkpoint after 200 SciPy iterations | 80, linear solve failed | 6, 6, 8 |
 
 The bordered restart reduced the augmented residual from 0.120827 to 0.120735 in three Newton steps. Its independent 128³ incflo replay over 144 steps gave a relative velocity return error of 100.12%. The checkpoint is an unconverged candidate. All eleven similarity tests passed on the MI250X and on CPU.
+
+Job `53521653` ran the pseudo-time command above on one MI250X die with 3,726 field coefficients, 160 radial and polar nodes, 247 effective azimuthal nodes, and 13 phase samples. It accepted 15 backward Euler steps with zero rejections and 123 total GMRES iterations. The largest implicit step residual was 7.50e-8. At pseudo-time 87.38 the forcing was 3.23e-9, the field coefficient norm was 2.32e-8 of its starting value, and the spiral norm was 4.11e-9 of its starting value. The absolute unforced projected residual was 2.32e-8 and the relative unforced defect was 1.00000075. The run reported `limit_below_amplitude_floor`. A 128³ incflo replay took 144 physical steps and measured 10.99% relative velocity return error on this nearly zero field. All twelve similarity tests passed on CPU and on the MI250X.

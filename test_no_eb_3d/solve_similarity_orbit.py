@@ -6,7 +6,7 @@ import math
 import os
 import tempfile
 import time
-from dataclasses import asdict, replace
+from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 
 import numpy as np
@@ -19,9 +19,43 @@ def host(a):
     return a.detach().cpu().numpy()
 
 
+@dataclass(frozen=True)
+class PseudoTimePath:
+    """The modeled fixed-m=19 path through the forced similarity equations of C.3."""
+
+    decay_time: float = 1.0
+    initial_g: float = 0.502
+    initial_viscosity: float = 1.0
+    initial_damping: float = 0.1
+
+    def __post_init__(self):
+        if not all(math.isfinite(v) for v in asdict(self).values()) or not (
+            self.decay_time > 0
+            and self.initial_viscosity > 0
+            and self.initial_damping >= 0
+        ):
+            raise ValueError(
+                "Invalid pseudo-time decay scale, dilation, viscosity or damping"
+            )
+
+    def parameters(self, strength):
+        return {
+            "dilation": 0.5 + (self.initial_g - 0.5) * strength,
+            "viscosity": (1.0 - strength) + self.initial_viscosity * strength,
+            "damping": self.initial_damping * strength,
+        }
+
+    def advance_clock(self, log_strength, step):
+        # Eliminate the backward-Euler row for d(lambda)/d(tau) = -lambda / decay_time.
+        log_ratio = math.log(step) - math.log(self.decay_time)
+        return log_strength - float(np.logaddexp(0.0, log_ratio))
+
+
 class OrbitEquation:
-    def __init__(self, space, seed, period):
+    def __init__(self, space, seed, period, path=None):
         self.space, self.period = space, period
+        self.path = path
+        self.family = path.parameters(1.0) if path else {}
         self.scale = np.linalg.norm(seed)
         if not 0 < self.scale < np.inf:
             raise ValueError("The reference field must be finite and nonzero")
@@ -46,12 +80,24 @@ class OrbitEquation:
         self.reference_linear = [host(f[-1]) for f in factors]
         self.inv = space.linear_inverse(factors)
         self.force = self.fluid(self.ref, 0.0)
+        if path:
+            axis = np.array([n == 0 and m == 0 for n, _, m, _, _, _ in space.labels])
+            # A manufactured steady axisymmetric base and a finite-amplitude wave imprint.
+            self.axis_force = np.where(axis, self.fluid(self.ref * axis, 0.0), 0.0)
+            self.wave_force = self.force - self.axis_force
+
+    def set_strength(self, strength):
+        self.family = self.path.parameters(strength)
+        self.force = self.axis_force + strength * self.wave_force
+
+    def factors(self, period):
+        return self.space.factors(period, **self.family)
 
     def scaled(self, raw):
         return host(self.space.scale_residual(raw, self.inv)) / self.scale
 
     def fluid(self, x, log_period):
-        factors = self.space.factors(self.period * math.exp(log_period))
+        factors = self.factors(self.period * math.exp(log_period))
         return self.scaled(
             self.space.residual(self.space.tensor(self.scale * x), factors)
         )
@@ -65,15 +111,24 @@ class OrbitEquation:
     def jacobian(self, y):
         return OrbitJacobian(self, y)
 
-    def metrics(self, y, raw=None):
+    def metrics(self, y, raw=None, target_raw=None):
         x = y[:-2]
         raw = self.fluid(x, y[-2]) if raw is None else raw
+        if target_raw is None:
+            if self.path:
+                factors = self.space.factors(self.period * math.exp(y[-2]))
+                target_raw = self.scaled(
+                    self.space.residual(self.space.tensor(self.scale * x), factors)
+                )
+            else:
+                target_raw = raw
         return {
             "period": self.period * math.exp(y[-2]),
             "forcing": float(y[-1]),
             "projected_residual": float(np.linalg.norm(raw - y[-1] * self.force)),
+            "unforced_projected_residual": float(np.linalg.norm(target_raw)),
             "unforced_relative_defect": float(
-                np.linalg.norm(raw) / max(np.linalg.norm(x), 1e-300)
+                np.linalg.norm(target_raw) / max(np.linalg.norm(x), 1e-300)
             ),
             "relative_field": float(np.linalg.norm(x)),
             "relative_spiral": float(
@@ -89,7 +144,7 @@ class OrbitJacobian:
     def __init__(self, eq, point):
         self.eq = eq
         x, log_s = point[:-2], point[-2]
-        self.factors = eq.space.factors(eq.period * math.exp(log_s))
+        self.factors = eq.factors(eq.period * math.exp(log_s))
         self.background = eq.space.fields(eq.space.tensor(eq.scale * x), self.factors)
         eps = 1e-5
         self.period_column = (eq.fluid(x, log_s + eps) - eq.fluid(x, log_s - eps)) / (
@@ -124,7 +179,8 @@ class OrbitJacobian:
 class CorrectorSystem:
     """The same augmented nonlinear equations for every corrector backend."""
 
-    def __init__(self, eq, predictor, normal, deflate):
+    def __init__(self, eq, predictor, normal, deflate, shift=0.0):
+        self.shift = shift
         self.eq, self.predictor, self.normal, self.deflate = (
             eq,
             predictor,
@@ -148,21 +204,28 @@ class CorrectorSystem:
     def residual(self, point):
         residual = self.eq.residual(point)
         residual[:-1] *= self.multiplier(point)[0]
+        if self.shift:
+            residual[:-1] += self.shift * (point[:-2] - self.predictor[:-2])
         return np.r_[residual, self.normal @ (point - self.predictor)]
 
     def linearize(self, point, residual):
         weight, derivative = self.multiplier(point)
+        steady = residual[:-2]
+        if self.shift:
+            steady = steady - self.shift * (point[:-2] - self.predictor[:-2])
         return CorrectorJacobian(
             self.eq.jacobian(point),
             self.normal,
             weight,
             derivative,
-            residual[:-2] / weight,
+            steady / weight,
+            self.shift,
         )
 
 
 class CorrectorJacobian:
-    def __init__(self, orbit, normal, weight, derivative, fluid_residual):
+    def __init__(self, orbit, normal, weight, derivative, fluid_residual, shift=0.0):
+        self.shift = shift
         self.orbit, self.normal = orbit, normal
         self.weight, self.derivative, self.fluid_residual = (
             weight,
@@ -175,10 +238,14 @@ class CorrectorJacobian:
         delta[:-1] = self.weight * delta[:-1] + self.fluid_residual * (
             self.derivative @ dy
         )
+        if self.shift:
+            delta[:-1] += self.shift * dy[:-2]
         return np.r_[delta, self.normal @ dy]
 
     def transpose(self, rhs):
         result = self.orbit.transpose(np.r_[self.weight * rhs[:-2], rhs[-2]])
+        if self.shift:
+            result[:-2] += self.shift * rhs[:-2]
         return (
             result
             + self.derivative * (self.fluid_residual @ rhs[:-2])
@@ -187,8 +254,13 @@ class CorrectorJacobian:
 
 
 def correct(eq, predictor, normal, tolerance, iterations, krylov, *, deflate=False):
-    y = predictor.copy()
-    system = CorrectorSystem(eq, predictor, normal, deflate)
+    return correct_system(
+        CorrectorSystem(eq, predictor, normal, deflate), tolerance, iterations, krylov
+    )
+
+
+def correct_system(system, tolerance, iterations, krylov):
+    y = system.predictor.copy()
     f = system.residual(y)
     linear_counts = []
     for iteration in range(iterations + 1):
@@ -199,10 +271,18 @@ def correct(eq, predictor, normal, tolerance, iterations, krylov, *, deflate=Fal
             break
         jac = system.linearize(y, f)
         op = LinearOperator((y.size, y.size), matvec=jac, dtype=np.float64)
+        preconditioner = None
+        if system.shift:
+            from similarity_petsc import BorderedStokes
+
+            preconditioner = LinearOperator(
+                op.shape, matvec=BorderedStokes(jac), dtype=np.float64
+            )
         history = []
         step, info = gmres(
             op,
             -f,
+            M=preconditioner,
             atol=norm * min(0.08, max(1e-5, math.sqrt(norm) * 0.15)),
             restart=min(y.size, krylov),
             maxiter=1,
@@ -304,6 +384,36 @@ def run_search(args):
         if args.restart or args.lift
         else None
     )
+    saved_path = source[0].get("ptc_path") if args.restart else None
+    use_ptc = args.pseudo_transient or saved_path is not None
+    requested_step = args.step
+    args.step = 0.2 if args.step is None else args.step
+    args.solver = args.solver or ("petsc" if use_ptc else "scipy")
+    path_values = {k: getattr(args, "ptc_" + k) for k in asdict(PseudoTimePath())}
+    supplied = {k: v for k, v in path_values.items() if v is not None}
+    if not use_ptc and (supplied or args.ptc_max_step is not None):
+        raise ValueError("Pseudo-time parameters require --pseudo-transient")
+    path = None
+    if use_ptc:
+        if args.direct:
+            raise ValueError(
+                "Use --lift to start a separate direct solve from a pseudo-time checkpoint"
+            )
+        if args.restart and saved_path is None:
+            raise ValueError(
+                "Use --lift with a Newton checkpoint to initialize a new pseudo-time path"
+            )
+        path = PseudoTimePath(**{**(saved_path or {}), **supplied})
+        if saved_path is not None and asdict(path) != saved_path:
+            raise ValueError(
+                "Use --lift to change the physics of a saved pseudo-time path"
+            )
+        if args.ptc_max_step is None:
+            args.ptc_max_step = source[0]["ptc_max_step"] if args.restart else 100.0
+        if not math.isfinite(args.ptc_max_step) or args.ptc_max_step < args.min_step:
+            raise ValueError(
+                "The maximum pseudo-time step must be finite and at least --min-step"
+            )
     original = Basis(**source[0]["basis"]) if source else Basis()
     basis = Basis(
         **{
@@ -337,7 +447,11 @@ def run_search(args):
         if args.grid != cfg["grid"] or basis != original:
             raise ValueError("Use --lift to continue on a different grid or basis")
         space = OrbitSpace(Basis(**cfg["basis"]), args.grid, dev)
-        step = min(step, args.step)
+        if use_ptc:
+            if requested_step is not None:
+                step = requested_step
+        else:
+            step = min(step, args.step)
     else:
         if (
             not 0 < args.period < np.inf
@@ -389,7 +503,25 @@ def run_search(args):
             args.step,
             0,
         )
-    eq = OrbitEquation(space, seed, cfg["period"])
+    if path:
+        cfg["ptc_path"] = asdict(path)
+        cfg["ptc_max_step"] = args.ptc_max_step
+        if not args.restart:
+            cfg.update(pseudo_time=0.0, log_forcing=0.0)
+        if not (
+            math.isfinite(cfg["pseudo_time"])
+            and cfg["pseudo_time"] >= 0
+            and math.isfinite(cfg["log_forcing"])
+            and cfg["log_forcing"] <= 0
+            and math.isclose(
+                y[-1], math.exp(cfg["log_forcing"]), rel_tol=1e-12, abs_tol=0.0
+            )
+        ):
+            raise ValueError("Inconsistent pseudo-time clock in checkpoint")
+        step = min(step, args.ptc_max_step)
+    eq = OrbitEquation(space, seed, cfg["period"], path)
+    if path:
+        eq.set_strength(y[-1])
     args.out.mkdir(parents=True, exist_ok=False)
     start = time.monotonic()
     report = {
@@ -407,17 +539,10 @@ def run_search(args):
     }
     initial_accepted = accepted
 
-    def correct_point(predictor, normal, deflate):
+    def correct_point(predictor, normal, deflate, shift=0.0):
+        system = CorrectorSystem(eq, predictor, normal, deflate, shift)
         if args.solver == "scipy":
-            return correct(
-                eq,
-                predictor,
-                normal,
-                args.tol,
-                args.newton,
-                args.krylov,
-                deflate=deflate,
-            )
+            return correct_system(system, args.tol, args.newton, args.krylov)
 
         def monitor(it, norm, linear_steps):
             print(
@@ -425,7 +550,6 @@ def run_search(args):
                 flush=True,
             )
 
-        system = CorrectorSystem(eq, predictor, normal, deflate)
         candidate, counts, converged, info = petsc_correct(
             system,
             args.tol,
@@ -436,6 +560,8 @@ def run_search(args):
             monitor=monitor,
         )
         info.update(starting_forcing=float(predictor[-1]), deflated=bool(deflate))
+        if shift:
+            info["mass_shift"] = shift
         report.setdefault("petsc_correctors", []).append(info)
         return candidate, counts, converged
 
@@ -450,6 +576,112 @@ def run_search(args):
         write_json(args.out / "search.json", report)
 
     save("running")
+    if path:
+        normal = np.zeros_like(y)
+        normal[-1] = 1.0
+        metrics = report["current"]
+
+        def limit_status():
+            if (
+                cfg["log_forcing"] > math.log(args.tol)
+                or math.hypot(
+                    metrics["unforced_projected_residual"], metrics["phase_error"]
+                )
+                > args.tol
+            ):
+                return None
+            if (
+                min(metrics["relative_spiral"], metrics["relative_field"])
+                < args.min_spiral
+            ):
+                return "limit_below_amplitude_floor"
+            if metrics["unforced_relative_defect"] <= args.tol:
+                return "unforced_projected_root"
+            return None
+
+        while accepted - initial_accepted < args.max_stages and limit_status() is None:
+            h = step
+            log_next = path.advance_clock(cfg["log_forcing"], h)
+            strength = math.exp(log_next)
+            next_time = cfg["pseudo_time"] + h
+            if strength == 0 or not cfg["pseudo_time"] < next_time < math.inf:
+                save("pseudo_time_precision_limit", metrics)
+                return
+            predictor = y.copy()
+            predictor[-1] = strength
+            eq.set_strength(strength)
+            candidate, counts, converged = correct_point(
+                predictor, normal, False, shift=1.0 / h
+            )
+            if converged:
+                candidate[-1] = strength
+                # Verify the implicit step after enforcing the independently solved clock row.
+                regularized = CorrectorSystem(eq, predictor, normal, False, 1.0 / h)
+                be_norm = float(np.linalg.norm(regularized.residual(candidate)))
+                met = eq.metrics(candidate)
+                converged = be_norm <= args.tol and all(
+                    math.isfinite(v) for v in met.values()
+                )
+            if not converged:
+                report["rejected_steps"] += 1
+                report["last_rejection"] = {
+                    "pseudo_time": cfg["pseudo_time"] + h,
+                    "dt": h,
+                    "reason": "implicit_solve",
+                }
+                eq.set_strength(y[-1])
+                if h / 2 < args.min_step:
+                    save("pseudo_time_stalled", metrics)
+                    return
+                step = h / 2
+                continue
+            previous, y = y, candidate
+            accepted += 1
+            cfg["pseudo_time"] = next_time
+            cfg["log_forcing"] = log_next
+            metrics = met
+            if min(met["relative_field"], met["relative_spiral"]) < args.min_spiral:
+                report.setdefault(
+                    "first_below_amplitude_floor",
+                    {
+                        "pseudo_time": next_time,
+                        "forcing": strength,
+                        "relative_field": met["relative_field"],
+                        "relative_spiral": met["relative_spiral"],
+                    },
+                )
+            step = min(
+                args.ptc_max_step,
+                h * (1.5 if len(counts) <= max(2, (args.newton + 1) // 2) else 1.0),
+            )
+            report["stages"].append(
+                {
+                    "stage": accepted,
+                    "pseudo_time": cfg["pseudo_time"],
+                    "dt": h,
+                    "implicit_residual": be_norm,
+                    "krylov_iterations": counts,
+                    **eq.family,
+                    **met,
+                }
+            )
+            print(
+                f"pseudo_time={cfg['pseudo_time']:.6g} dt={h:.5g} forcing={strength:.6g} "
+                f"unforced_defect={met['unforced_relative_defect']:.6g} spiral={met['relative_spiral']:.5g}",
+                flush=True,
+            )
+            checkpoint(
+                args.out / "stages" / f"stage-{accepted:04d}.npz",
+                cfg,
+                seed,
+                y,
+                previous,
+                step,
+                accepted,
+            )
+            save("running", metrics)
+        save(limit_status() or "pseudo_time_budget_reached", metrics)
+        return
     if args.direct:
         predictor = y.copy()
         predictor[-1] = 0.0
@@ -573,13 +805,16 @@ def audit(args):
             old_labels = sp.labels
         ref = transfer(seed, old_labels, sp.labels)
         state = np.r_[transfer(y[:-2], old_labels, sp.labels), y[-2:]]
-        eq = OrbitEquation(sp, ref, cfg["period"])
+        path = PseudoTimePath(**cfg["ptc_path"]) if "ptc_path" in cfg else None
+        eq = OrbitEquation(sp, ref, cfg["period"], path)
+        if path:
+            eq.set_strength(y[-1])
         period = cfg["period"] * math.exp(state[-2])
         factors = sp.factors(period)
         field = sp.tensor(state[:-2] * eq.scale)
         raw = sp.residual(field, factors)
         white = eq.scaled(raw)
-        met = eq.metrics(state, white)
+        met = eq.metrics(state, target_raw=white) if path else eq.metrics(state, white)
         weak = sp.weak_defect(field, raw, factors, period)
         retained = set(old_labels)
         new_modes = np.array([label not in retained for label in sp.labels])
@@ -720,10 +955,46 @@ def parser():
         action="store_true",
         help="Apply deflated Newton at exactly zero forcing",
     )
-    s.add_argument("--step", type=float, default=0.2)
+    s.add_argument(
+        "--pseudo-transient",
+        action="store_true",
+        help="March the forced orbit family implicitly in artificial time",
+    )
+    s.add_argument(
+        "--ptc-decay-time",
+        type=float,
+        help="Exponential forcing decay time (default 1)",
+    )
+    s.add_argument(
+        "--ptc-initial-g",
+        type=float,
+        help="Initial similarity dilation (default 0.502)",
+    )
+    s.add_argument(
+        "--ptc-initial-viscosity", type=float, help="Initial viscosity (default 1)"
+    )
+    s.add_argument(
+        "--ptc-initial-damping",
+        type=float,
+        help="Initial damping of non-axisymmetric modes (default 0.1)",
+    )
+    s.add_argument(
+        "--ptc-max-step",
+        type=float,
+        help="Largest backward Euler pseudo-time step (default 100)",
+    )
+    s.add_argument(
+        "--step",
+        type=float,
+        help="Initial step (default 0.2). A pseudo-time restart uses its saved step unless overridden",
+    )
     s.add_argument("--min-step", type=float, default=0.001)
     s.add_argument("--max-stages", type=int, default=24)
-    s.add_argument("--solver", choices=("scipy", "petsc"), default="scipy")
+    s.add_argument(
+        "--solver",
+        choices=("scipy", "petsc"),
+        help="Default is PETSc for pseudo-time and SciPy otherwise",
+    )
     s.add_argument("--snes-type", help="PETSc SNES method (default newtonls)")
     s.add_argument(
         "--pc",

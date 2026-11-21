@@ -12,9 +12,11 @@ class BorderedStokes:
         eq = jac.orbit.eq
         self.basis = eq.space.basis
         self.weight = jac.weight
-        # The equations already carry L_ref^-1 on the left, so B^-1 = L(S)^-1 L_ref.
+        # The field rows carry L_ref^-1. A coefficient-space pseudo-mass shift adds shift*L_ref before inversion.
         self.blocks = [
-            np.linalg.solve(factor[-1].detach().cpu().numpy(), ref)
+            np.linalg.solve(
+                factor[-1].detach().cpu().numpy() + (jac.shift / jac.weight) * ref, ref
+            )
             for factor, ref in zip(jac.orbit.factors, eq.reference_linear, strict=True)
         ]
         self.rows = np.stack((eq.phase, jac.normal[:-2], jac.derivative[:-2]))

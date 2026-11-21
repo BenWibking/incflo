@@ -196,6 +196,9 @@ def pair(a, b, weight):
 class Band:
     def __init__(self, n, modes, basis, r, wr, mu, wmu, phi, tensor):
         self.n = n
+        self.nonaxisymmetric = tensor(
+            np.array([m > 0 for m, _ in modes])[None, :, None]
+        )
         self.r = tensor(r[:, None, None])
         self.weight = tensor(wr[:, None, None])
         self.lam = tensor(np.array([l * (l + 1) for _, l in modes])[None, :, None])
@@ -212,7 +215,7 @@ class Band:
             for tail in (1, 3)
         ]
 
-    def factors(self, omega, viscosity):
+    def factors(self, omega, viscosity, dilation=0.5, damping=0.0):
         w = self.n * omega
         trial, curl, drift = components(
             self.r, self.lam, self.h1, self.h2, w, self.potentials[0]
@@ -220,7 +223,10 @@ class Band:
         test, curl_test, _ = components(
             self.r, self.lam, self.h1, self.h2, w, self.potentials[1]
         )
-        linear = [(0.5 + 1j * w) * v + 0.5 * d for v, d in zip(trial, drift)]
+        mass = 1 - dilation + 1j * w
+        if damping:
+            mass = mass + damping * self.nonaxisymmetric
+        linear = [mass * v + dilation * d for v, d in zip(trial, drift)]
         angular_norm = self.lam
         tw = self.weight * (0.5 if self.n else 1.0)
 
@@ -304,10 +310,13 @@ class OrbitSpace:
                 parts.append(data.imag.flatten())
         return torch.cat(parts)
 
-    def factors(self, period):
+    def factors(self, period, *, dilation=0.5, viscosity=None, damping=0.0):
         if not math.isfinite(period) or period <= 0:
             raise ValueError("Period must be finite and positive")
-        return [b.factors(2 * np.pi / period, self.viscosity) for b in self.bands]
+        nu = self.viscosity if viscosity is None else viscosity
+        return [
+            b.factors(2 * np.pi / period, nu, dilation, damping) for b in self.bands
+        ]
 
     def fields(self, vector, factors):
         vel, vort = [], []
