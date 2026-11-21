@@ -25,13 +25,15 @@ class FullSphereBasis(WaveBasis):
     def groups(self):
         # Both hemispheres are independent and joined by interior splines at z=0.
         # A and B are the radial and polar potentials used by WaveMeridian.
-        def pair(cr, ca):
+        def pair(cr, ca, vanish_left=False):
             return (
-                Splines(self.sigma_breaks, self.degree, cr),
+                Splines(self.sigma_breaks, self.degree, cr, vanish_left=vanish_left),
                 Splines(self.full_eta, self.degree, ca),
             )
 
-        return [super().groups[0], {"A": pair(2, 1), "B": pair(1, 2)}]
+        mean = {"S": pair(2, 2, True), "T": pair(1, 1, True), "gamma": (None, None)}
+        wave = {"A": pair(2, 1), "B": pair(1, 2)}
+        return [mean] + [wave] * self.harmonics
 
 
 MESHES = {

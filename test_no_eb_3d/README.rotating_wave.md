@@ -89,6 +89,72 @@ On Setonix, the first three meshes ranked the packet gains in decreasing order f
 
 The core energy centroid for mode 14 moved from cylindrical radius 39.7 to 28.3. Refinement from 932 to 2,124 coefficients changed the core amplitude gains by less than 0.004. The corresponding endpoint fields differed by 25% and 43% in the core velocity norm after alignment on the independent 391 by 390 quadrature. These measurements describe transient evolution for the two trial polarizations.
 
+## Solve and evolve a finite-amplitude wave in full space
+
+The `full-wave` driver solves for a rotating field with fundamental azimuthal wave number `m`, a free mean and nonlinear harmonics. It uses the saved axisymmetric velocity as an affine part of the trial space. Independent splines on both sides of the equator allow the mean and the wave to break the base symmetry. The far-field power is `(1-g)/g` and the radial phase winds at the current rotation frequency. The localized auxiliary term on the left of the momentum equation for each wave harmonic is
+
+```text
+d U_j / [1 + (|y|/60)²],     j > 0
+```
+
+Positive `d` removes energy and negative `d` supplies it. The damping window and the prescribed torque profile are modeling choices. PETSc SNES solves for `d`, the fundamental phase frequency `omega`, the mean correction and the complex wave coefficients. The two extra scalar equations prescribe the fundamental core velocity norm relative to the saved base and fix the azimuthal phase. The angular speed is `omega/m`. The azimuthal torque stays at its measured reference value during these solves.
+
+Start with a packet checkpoint from the refined linear scan. The driver re-equilibrates the mean in the selected weak test space, tracks a packet-overlapping eigenpair to real auxiliary damping, and continues in nonzero amplitude. The optional `residual` seed ranking also compares the pressure-fitted linear momentum defects of the shortlisted modes.
+
+```bash
+driver=src/test_no_eb_3d/setonix/rotating-wave.sbatch
+packet=mode-probe-REFINED_JOB_ID-0
+for m in 14 19; do
+    sbatch -A YOUR_PROJECT-gpu -p gpu-highmem "$driver" full-wave \
+        --m "$m" --packet "$packet/m$m.npz" --mesh fine --grid 192 \
+        --seed-selection residual --iterations 70 --audit-grids 224 288 \
+        --pressure-degrees 5 6 --amplitudes .001 .003 .007 .01 .015 .02 .03 .06 .10
+done
+```
+
+Each stage records its nonlinear solver status in `search.json` and writes `stage-NN.npz`. The solver also preserves failed trials for diagnosis. Use a stage with `weak_converged=true` to restart or transfer to a nested velocity space. Set `--restart CHECKPOINT` in place of `--packet`. The independent physical audit refits pressure on a finer integration grid, includes the quadratic products through twice the highest retained harmonic, and reports the wave momentum residual separately from the much larger axisymmetric terms. The norm integrates over both hemispheres and all azimuths.
+
+Two additional checks run from a saved stage. The direct `fit-wave` optimization minimizes the pressure-fitted full-space residual in the physical H norm, preserves the prescribed amplitude and phase, and varies the mean, harmonics, frequency and signed damping. The `evolve-wave` calculation removes both scalar constraints and evolves the velocity in the candidate's rotating frame with the torque and damping held fixed. It uses a second-order implicit-explicit step, additional spatial degrees of freedom and additional azimuthal harmonics. One fundamental period advances the pattern through an angle `2π/m`. Comparing two time steps tests time integration accuracy.
+
+```bash
+wave=full-wave-SEARCH_JOB_ID-0/stage-NN.npz
+sbatch -A YOUR_PROJECT-gpu -p gpu-highmem "$driver" fit-wave "$wave" \
+    --grid 160 --pressure-degree 4 --amplitudes .03 .10 --iterations 120 \
+    --audit-grid 256 --audit-degree 6
+fit=fit-wave-FIT_JOB_ID-0/stage-00.npz
+sbatch -A YOUR_PROJECT-gpu -p gpu-highmem "$driver" evolve-wave "$fit" \
+    --mesh fine --degree 4 --grid 192 --harmonics 4 --steps 192 384
+```
+
+`evolution.json` reports the wave amplitude gain, the change in the corotating frame, and the change after removing any additional phase drift of the fundamental. The last two quantities include every evolved wave harmonic and are normalized to the initial core wave velocity norm. An exact rotating wave would have gain one and zero change throughout the period.
+
+To hold a finite wave specifically on the northern inflow layer, pass `--anchor inflow --packet "$packet/m19.npz"` to `fit-wave` for mode 19, or use the corresponding mode 14 packet. This restores the original mean, fits the saved localized velocity packet, and measures the wave amplitude and phase using the squared packet envelope centered at cylindrical `r=40, z=6.5`. A target of 0.10 prescribes a fundamental amplitude equal to 10% of the reference mean velocity norm in that same window. The physical momentum norm still covers the whole space. The `inflow_region_energy_fraction` diagnostic uses the wider annulus `20 < r < 65, |z| < 20` and the standard core weighting. The `layer_phase_aligned_change` diagnostic in the free evolution uses the packet window.
+
+Refine a saved physical fit by passing `--degree 4 --harmonics 3 --anchor inflow` to `fit-wave`. Follow it with `evolve-wave --mesh fine --degree 5 --harmonics 5` for an independent time march. To inspect velocity-field changes between fits on a common quadrature, run
+
+```bash
+python3 src/test_no_eb_3d/compare_full_waves.py "$coarse" "$refined" --out field-comparison.json
+```
+
+On Setonix, core-normalized 10% trials produced a low wave residual on refinement. The `m=19` trial reached a relative wave H defect of 0.00777 and a one-period core shape change of 0.0640. Only 1.82% of its core-weighted wave energy lay in the inflow annulus, and its velocity amplitude in the packet window grew by a factor of 1.86 during the independent march.
+
+Fixing the amplitude on the inflow layer itself gave the following results at `g=0.502`, unit viscosity, torque 118.45044, and layer amplitude ratio 0.10. The residual uses a 288 by 288 meridional grid and degree-seven pressure. The quartic velocity fit retained the mean and three harmonics. The independent free evolution used quintic elements, five harmonics, 224 by 224 meridional quadrature nodes and 768 time steps per fundamental period.
+
+| Mode | Period | Signed damping | Wave relative H | Wave energy fraction in annulus | Layer amplitude after one period / initial | Phase-aligned relative change on layer |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| 14 | 3.3206 | −0.5512 | 0.0980 | 0.9193 | 0.0753 | 0.9889 |
+| 19 | 2.8179 | −0.9090 | 0.0967 | 0.9185 | 0.0882 | 0.9904 |
+
+Increasing the velocity degree from three to four and adding the third harmonic reduced the respective wave defects from 0.1786 and 0.1828. The corresponding core wave velocity fields changed by 35% and 41% after phase alignment. Doubling the time steps from 384 to 768 changed the final layer amplitude ratios by less than 0.000004. Both localized trials lost over 90% of their layer amplitude, so these runs ended at fixed torque.
+
+To plot the initial axial wave vorticity and the layer shape change measured during the free evolutions, run
+
+```bash
+python3 src/test_no_eb_3d/plot_full_wave_search.py \
+    --run "$m14" "$cycle14/evolution.json" --run "$m19" "$cycle19/evolution.json" \
+    --out inflow-wave-cycles.png
+```
+
 ## Single rotating wave
 
 `solve_rotating_wave.py` searches the auxiliary problem described in Appendix C.3. In the upper half-space it uses an axisymmetric mean and harmonics of one traveling phase `kappa*phi - omega*s`. The radial basis includes the winding of this phase at infinity. Both the dilation exponent `g` and the phase frequency `omega` are unknown, with viscosity fixed at one. The fundamental has prescribed positive RMS speed in a fixed core weight. A phase condition sets its azimuthal orientation. A real wave number defines a periodic sector of width `2*pi/kappa`.

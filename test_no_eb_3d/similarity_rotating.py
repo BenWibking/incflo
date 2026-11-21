@@ -223,7 +223,7 @@ def lift_coefficients(old, new, coeff):
                     (
                         transfer(sr, nr, new.sigma_breaks)
                         @ block
-                        @ transfer(sa, na, new.eta_breaks).T
+                        @ transfer(sa, na, new.full_eta).T
                     ).ravel()
                 )
         result.append(np.array(dest))
@@ -277,7 +277,9 @@ class WaveGeometry:
 
 
 class WaveSpace:
-    def __init__(self, basis, grid, device, kappa):
+    def __init__(
+        self, basis, grid, device, kappa, *, quadrature_basis=None, angular_grid=None
+    ):
         if not math.isfinite(kappa) or kappa < 3:
             raise ValueError(
                 "The reduced azimuthal wave number must be finite and at least three"
@@ -288,12 +290,19 @@ class WaveSpace:
             torch.device(device),
             kappa,
         )
-        sig, ws = gauss_elements(basis.sigma_breaks, grid)
-        eta, wa = gauss_elements(basis.full_eta, grid)
+        mesh = basis if quadrature_basis is None else quadrature_basis
+        if mesh.radius != basis.radius or mesh.full_eta[0] != basis.full_eta[0]:
+            raise ValueError(
+                "Trial and quadrature must use the same domain and radial map"
+            )
+        sig, ws = gauss_elements(mesh.sigma_breaks, grid)
+        eta, wa = gauss_elements(
+            mesh.full_eta, grid if angular_grid is None else angular_grid
+        )
         if (
             min(
-                len(sig) // (len(basis.sigma_breaks) - 1),
-                len(eta) // (len(basis.full_eta) - 1),
+                len(sig) // (len(mesh.sigma_breaks) - 1),
+                len(eta) // (len(mesh.full_eta) - 1),
             )
             < basis.degree + 4
         ):
@@ -457,7 +466,7 @@ class RotatingWave:
         if space.basis.harmonics < 1:
             raise ValueError("A rotating wave requires a nonzero angular harmonic")
         self.space = space
-        geo = WaveGeometry(space, space.kappa, g, omega)
+        geo = self.make_geometry(g, omega)
         self.geo = geo
         self.reference_twist = geo.twist
         self.omega_scale = max(1.0, abs(omega))
@@ -516,10 +525,19 @@ class RotatingWave:
             raise ValueError("Unresolved similarity tail")
         return 1 / (1.5 + math.exp(x[-2])), self.omega_scale * x[-1]
 
+    def make_geometry(self, g, omega):
+        return WaveGeometry(self.space, self.space.kappa, g, omega)
+
+    def applied_terms(self, x, U, raw):
+        return raw
+
+    def damping_weight(self, x, j):
+        return None
+
     def geometry(self, x):
         g, omega = self.parameters(x)
         if self.geo.g != g or self.geo.omega != omega:
-            self.geo = WaveGeometry(self.space, self.space.kappa, g, omega)
+            self.geo = self.make_geometry(g, omega)
         return self.geo
 
     def coefficients(self, x):
@@ -579,6 +597,7 @@ class RotatingWave:
     def evaluate(self, x, forcing):
         geo = self.geometry(x)
         U, _, _, raw = geo.raw(self.coefficients(x))
+        raw = self.applied_terms(x, U, raw)
         proj = [
             (P @ (self.rotation(geo, j) * raw[j]).reshape(-1)).cpu().numpy()
             for j, P in enumerate(self.projectors)
@@ -620,6 +639,9 @@ class RotatingWave:
             h = t.transpose(1, 2)
             if mode == j:
                 h = h + dense_columns(geo.linear[j]) @ self.columns[j]
+                weight = self.damping_weight(x, j)
+                if weight is not None:
+                    h = h + weight.reshape(-1, 1, 1) * V[j]
             return projector @ h.reshape(-1, width)
 
         rows = []

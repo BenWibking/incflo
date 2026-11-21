@@ -21,6 +21,12 @@ elif [[ $mode == axisymmetric ]]; then
     args=("$PWD/src/test_no_eb_3d/solve_axisymmetric.py" --out "$PWD/axisymmetric-$SLURM_JOB_ID-${SLURM_RESTART_COUNT:-0}" --device gpu "$@")
 elif [[ $mode == probe ]]; then
     args=("$PWD/src/test_no_eb_3d/probe_rotating_modes.py" --out "$PWD/mode-probe-$SLURM_JOB_ID-${SLURM_RESTART_COUNT:-0}" --device gpu "$@")
+elif [[ $mode == full-wave ]]; then
+    args=("$PWD/src/test_no_eb_3d/solve_full_rotating_wave.py" --out "$PWD/full-wave-$SLURM_JOB_ID-${SLURM_RESTART_COUNT:-0}" --device gpu "$@")
+elif [[ $mode == evolve-wave ]]; then
+    args=("$PWD/src/test_no_eb_3d/evolve_full_wave.py" --out "$PWD/evolve-wave-$SLURM_JOB_ID-${SLURM_RESTART_COUNT:-0}" --device gpu "$@")
+elif [[ $mode == fit-wave ]]; then
+    args=("$PWD/src/test_no_eb_3d/polish_full_wave.py" --out "$PWD/fit-wave-$SLURM_JOB_ID-${SLURM_RESTART_COUNT:-0}" --device gpu "$@")
 else
     args=("$driver" "$mode" --out "$PWD/wave-$SLURM_JOB_ID-${SLURM_RESTART_COUNT:-0}" --device gpu "$@")
 fi
