@@ -367,11 +367,10 @@ class Meridian:
     def D(self, r, frequency):
         return self.dx * r.deriv() + frequency * self.phase_slope * r
 
-    def curl(self, fields, mode, frequency, sign):
+    def curl(self, fields, frequency, dm):
         u, v, w = fields
         # Components represent (u, sin(theta)*v, sin(theta)*w). The curl
         # exchanges the sine and cosine sectors. Imposing div=0 uses the same frame.
-        dm = sign * 19 * mode.j
         c0 = angular(w, lambda a: (-1) * (self.t * a).deriv())
         c1 = radial(w, lambda r: (-1) * (self.D(r, frequency) + r))
         if dm:
@@ -417,11 +416,11 @@ class Meridian:
         elif field == "dilation":
             out = [radial(c, lambda q: self.D(q, freq)) for c in velocity]
         else:
-            vort = self.curl(velocity, mode, freq, sign)
+            vort = self.curl(velocity, freq, sign * 19 * mode.j)
             if field == "curl":
                 out = vort
             else:
-                curlcurl = self.curl(vort, mode, freq, -sign)
+                curlcurl = self.curl(vort, freq, -sign * 19 * mode.j)
                 if field == "curlcurl":
                     out = curlcurl
                 elif field == "linear":
@@ -834,10 +833,24 @@ class PaperSpace:
 class PressureFit:
     """Weighted least squares on continuous element pressures with square-integrable gradients."""
 
-    def __init__(self, space, period, n, j, enrichment):
+    def __init__(
+        self,
+        space,
+        period,
+        n,
+        j,
+        enrichment,
+        *,
+        angular_order=None,
+        radial_frequency=None,
+    ):
         self.space = space
         mer = space.meridian
         basis = space.basis
+        angular_order = 19 * j if angular_order is None else angular_order
+        radial_frequency = (
+            2j * np.pi * n / period if radial_frequency is None else radial_frequency
+        )
         degree = basis.degree + enrichment
         if (
             min(
@@ -864,9 +877,9 @@ class PressureFit:
         for r, a in pairs:
             ir = mer.ir.v[0]
             cols = [
-                [(ir * mer.D(r, 2j * np.pi * n / period).v[0], a.v[0])],
+                [(ir * mer.D(r, radial_frequency).v[0], a.v[0])],
                 [(ir * r.v[0], -sn * a.deriv().v[0])],
-                [(ir * r.v[0], 1j * 19 * j * a.v[0] / sn)] if j else [],
+                [(ir * r.v[0], 1j * angular_order * a.v[0] / sn)] if j else [],
             ]
             parts.append(cols)
         self.op = Operator(

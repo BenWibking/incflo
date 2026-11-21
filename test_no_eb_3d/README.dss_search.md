@@ -4,6 +4,8 @@ The harness minimizes the one-period return error of a nonzero initial velocity 
 
 The GPU space-time Galerkin solver searches for a periodic orbit directly in similarity coordinates and exports fields for this harness to replay. [Direct orbit solver](README.similarity_orbit.md)
 
+The upper-half-space solver searches for one rotating wave at finite amplitude, with free similarity exponent and phase frequency. [Rotating-wave search and Setonix commands](README.rotating_wave.md)
+
 ## Build with Enzyme on a CPU
 
 The commands below run from a working directory containing this checkout in `src/`. Use upstream LLVM Clang and a ClangEnzyme plugin compiled for the same major LLVM version. The tested generator used LLVM 23.1.6 and Enzyme 0.0.311. On a Mac, Homebrew supplies both with `brew install llvm enzyme cmake ninja`. Use Python 3.10 or later with NumPy and SciPy, for example in a virtual environment with `python3 -m pip install numpy scipy`. The optional `pack` command also uses yt.
