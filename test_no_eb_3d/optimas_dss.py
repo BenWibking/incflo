@@ -1,4 +1,4 @@
-"""Use Optimas to propose seed families and evaluate their one-cycle recurrence on two grids."""
+"""Use Optimas to search for one-cycle recurrence on matched grids."""
 
 import argparse
 import hashlib
@@ -11,6 +11,7 @@ from contextlib import redirect_stdout
 from pathlib import Path
 
 import numpy as np
+from dss_resolution import richardson_return
 from dss_vorticity import INPUTS, measure, replay
 from mpi4py import MPI
 from optimize_dss import DEFAULT_SEARCH_STEPS, MIN_SEARCH_GRID, search, search_seed
@@ -64,20 +65,30 @@ def evaluate(args, proposal, stage):
                 jitter=0.12,
                 iterations=args.iterations,
                 plots=True,
+                richardson_grids=(args.middle_grid, args.fine_grid)
+                if args.mode == "richardson"
+                else None,
+                richardson_steps=(args.middle_steps, args.fine_steps),
+                richardson_order=args.order,
+                check_direction=args.check_direction and trial == 0,
             )
             with (directory / "optimizer.log").open("w") as log, redirect_stdout(log):
                 search(inner)
         run = coarse / "candidate"
+        if args.mode == "richardson":
+            for name, n in (("middle", args.middle_grid), ("fine", args.fine_grid)):
+                (run / f"n{n}").rename(directory / name)
         steps = args.coarse_steps
     else:
-        run = directory / "fine"
+        run = directory / stage
         previous = json.loads((directory / "coarse-score.json").read_text())
         if control_hash(control) != previous["control_sha256"]:
             raise ValueError(f"Accepted control changed for trial {trial}")
-        report = json.loads((coarse / "search.json").read_text())
-        run.mkdir()
-        replay(report, control, args.exe, INPUTS, run, args.fine_grid, args.fine_steps)
-        steps = args.fine_steps
+        steps = args.middle_steps if stage == "middle" else args.fine_steps
+        if args.mode == "screen":
+            report = json.loads((coarse / "search.json").read_text())
+            run.mkdir()
+            replay(report, control, args.exe, INPUTS, run, args.fine_grid, steps)
     if (
         os.environ.get("DSS_EXPECT_HIP") == "1"
         and "HIP initialized with 1 device" not in (run / "incflo.log").read_text()
@@ -98,7 +109,7 @@ def evaluate(args, proposal, stage):
         "end": time.time(),
     }
     if stage == "fine":
-        row["promotion"] = proposal["promotion"]
+        row["promotion"] = proposal.get("promotion", "all three grids")
     write_json(directory / f"{stage}-score.json", row)
     return row
 
@@ -125,8 +136,42 @@ def select_fine(proposals, coarse, batch, count):
     ]
 
 
+def score_triplet(directory, coarse, middle, fine, order):
+    levels = [coarse, middle, fine]
+    if len({r["control_sha256"] for r in levels}) != 1:
+        raise ValueError("Three-grid scores have different control hashes")
+    grids = [r["grid"] for r in levels]
+    metrics = {
+        key: richardson_return([r[key] for r in levels], grids, order)[0]
+        for key in ("velocity_return", "vorticity_return", "m19_return")
+    }
+    report = json.loads((directory / "coarse/search.json").read_text())
+    if not np.isclose(
+        metrics["velocity_return"]["score"],
+        report["final_guided_return"],
+        rtol=2e-7,
+        atol=2e-9,
+    ):
+        raise RuntimeError(
+            "Projected plotfiles disagree with the three-grid optimization objective"
+        )
+    result = {
+        "trial": fine["trial"],
+        "score": max(v["score"] for v in metrics.values()),
+        "fine_score": fine["score"],
+        "control_sha256": fine["control_sha256"],
+        "grids": grids,
+        "steps": [r["steps"] for r in levels],
+        "metrics": metrics,
+    }
+    write_json(directory / "richardson-score.json", result)
+    return result
+
+
 def run(args):
     comm = MPI.COMM_WORLD
+    use_richardson = args.mode == "richardson"
+    ranking = "richardson" if use_richardson else "fine"
     if comm.rank == 0:
         import torch
         from gest_api.vocs import VOCS
@@ -166,18 +211,45 @@ def run(args):
             )
         proposals = comm.bcast(proposals, root=0)
         coarse = evaluate_batch(comm, args, proposals, "coarse")
-        promoted = select_fine(proposals, coarse, batch, args.fine_per_batch)
+        middle = {}
+        if use_richardson:
+            middle = {
+                r["trial"]: r for r in evaluate_batch(comm, args, proposals, "middle")
+            }
+            promoted = proposals
+        else:
+            promoted = select_fine(proposals, coarse, batch, args.fine_per_batch)
         fine = evaluate_batch(comm, args, promoted, "fine")
         if comm.rank == 0:
             observed = {r["trial"]: r for r in fine}
-            for p in proposals:
-                trial = p["_id"]
-                if trial in observed:
+            scores = {}
+            for row in coarse:
+                trial = row["trial"]
+                record = {
+                    "batch": batch + 1,
+                    "coarse": row,
+                    "fine": observed.get(trial),
+                }
+                if use_richardson:
+                    record["middle"] = middle[trial]
+                    record["richardson"] = score_triplet(
+                        args.out / f"trial-{trial:05}",
+                        row,
+                        middle[trial],
+                        observed[trial],
+                        args.order,
+                    )
+                history.append(record)
+                if record[ranking] is not None:
+                    scores[trial] = record[ranking]["score"]
+            for proposal in proposals:
+                trial = proposal["_id"]
+                if trial in scores:
                     generator.ingest(
                         [
                             {
-                                **p,
-                                "score": observed[trial]["score"],
+                                **proposal,
+                                "score": scores[trial],
                                 "_status": TrialStatus.COMPLETED,
                             }
                         ]
@@ -186,22 +258,20 @@ def run(args):
                     generator.ax_client.abandon_trial(
                         trial, reason="Coarse screening; fine score unobserved"
                     )
-            history.extend(
-                {"batch": batch + 1, "coarse": r, "fine": observed.get(r["trial"])}
-                for r in coarse
-            )
             paired = [r for r in history if r["fine"] is not None]
             correlation = spearmanr(
                 [r["coarse"]["score"] for r in paired],
                 [r["fine"]["score"] for r in paired],
             ).statistic
-            best = min(paired, key=lambda r: (r["fine"]["score"], r["fine"]["trial"]))[
-                "fine"
-            ]
+            best = min(
+                (r[ranking] for r in paired), key=lambda r: (r["score"], r["trial"])
+            )
             write_json(
                 args.out / "summary.json",
                 {
                     "best": best,
+                    "ranking": ranking,
+                    "middle_count": len(paired) if use_richardson else 0,
                     "coarse_count": len(history),
                     "fine_count": len(paired),
                     "paired_spearman": float(correlation)
@@ -211,7 +281,7 @@ def run(args):
                 },
             )
             print(
-                f"Batch {batch + 1} complete. Best fine score {best['score']:.6g}, trial {best['trial']}",
+                f"Batch {batch + 1} complete. Best {ranking} score {best['score']:.6g}, trial {best['trial']}",
                 flush=True,
             )
 
@@ -234,14 +304,27 @@ if __name__ == "__main__":
         help="Override the modeled seed generated on the optimization grid",
     )
     parser.add_argument("--out", required=True, type=Path)
+    parser.add_argument(
+        "--mode", choices=("richardson", "screen"), default="richardson"
+    )
     parser.add_argument("--coarse-grid", type=int, default=MIN_SEARCH_GRID)
+    parser.add_argument("--middle-grid", type=int, default=160)
     parser.add_argument("--fine-grid", type=int, default=192)
     parser.add_argument("--coarse-steps", type=int, default=DEFAULT_SEARCH_STEPS)
+    parser.add_argument("--middle-steps", type=int, default=120)
     parser.add_argument("--fine-steps", type=int, default=144)
+    parser.add_argument("--order", type=float, default=2.0)
+    parser.add_argument(
+        "--check-direction",
+        action="store_true",
+        help="Check trial zero's combined three-grid gradient",
+    )
     parser.add_argument("--iterations", type=int, default=3)
     parser.add_argument("--batches", type=int, default=2)
     parser.add_argument("--batch-size", type=int, default=8)
-    parser.add_argument("--fine-per-batch", type=int, default=4)
+    parser.add_argument(
+        "--fine-per-batch", type=int, help="Number of fine replays in screened mode"
+    )
     parser.add_argument("--inner-seed", type=int, default=19005)
     parser.add_argument("--design-seed", type=int, default=319)
     args = parser.parse_args()
@@ -249,14 +332,35 @@ if __name__ == "__main__":
         parser.error(
             f"Optimization requires at least {MIN_SEARCH_GRID} cells per dimension"
         )
+    if args.mode == "richardson":
+        if args.fine_per_batch is not None or not (
+            args.coarse_grid < args.middle_grid < args.fine_grid
+            and args.coarse_steps * args.middle_grid
+            == args.middle_steps * args.coarse_grid
+            and args.coarse_steps * args.fine_grid == args.fine_steps * args.coarse_grid
+            and np.isfinite(args.order)
+            and args.order > 0
+        ):
+            parser.error(
+                "Richardson mode evaluates every trial at three increasing grids with constant steps/grid and positive order"
+            )
+    elif args.check_direction:
+        parser.error("--check-direction requires --mode richardson")
+    if args.fine_per_batch is None:
+        args.fine_per_batch = (
+            args.batch_size if args.mode == "richardson" else min(4, args.batch_size)
+        )
     if not (
-        2 <= args.fine_per_batch <= args.batch_size
+        (1 if args.mode == "richardson" else 2)
+        <= args.fine_per_batch
+        <= args.batch_size
         and args.fine_grid > args.coarse_grid
         and args.fine_steps >= args.coarse_steps >= 1
         and min(args.iterations, args.batches) >= 1
     ):
         parser.error(
-            "Need 2 <= fine-per-batch <= batch-size, finer second grid, and positive step and iteration budgets"
+            "Need positive batch, step and iteration budgets, a finer final grid, "
+            "and at least two fine promotions per batch in screened mode"
         )
     args.exe, args.out = args.exe.resolve(), args.out.resolve()
     if args.seed is not None:

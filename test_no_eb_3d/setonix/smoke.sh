@@ -34,8 +34,8 @@ from pathlib import Path
 root=Path(sys.argv[1])
 runs=[json.loads(f.read_text()) for f in sorted(root.glob("seed-*/search.json"))]
 assert len(runs)==len({r["initial_sha256"] for r in runs})==8
-assert all(r["grid"] >= 128 for r in runs)
-assert all(r["iterations"]>=1 and 0 < r["final_return"] < r["first_return"] for r in runs)
+assert all(r["grids"] == [128,160,192] for r in runs)
+assert all(r["iterations"]>=1 and 0 < r["final_guided_return"] < r["first_guided_return"] for r in runs)
 (root/"summary.json").write_text(json.dumps(runs,indent=2)+"\n")
-print([(r["random_seed"],r["first_return"],r["final_return"]) for r in runs])
+print([(r["random_seed"],r["first_guided_return"],r["final_guided_return"]) for r in runs])
 PY

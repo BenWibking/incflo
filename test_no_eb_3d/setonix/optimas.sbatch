@@ -3,7 +3,7 @@
 #SBATCH --partition=gpu-dev
 #SBATCH --nodes=1
 #SBATCH --exclusive
-#SBATCH --time=00:40:00
+#SBATCH --time=01:15:00
 #SBATCH --output=optimas-%j.log
 set -euo pipefail
 cd "${SLURM_SUBMIT_DIR:?}"

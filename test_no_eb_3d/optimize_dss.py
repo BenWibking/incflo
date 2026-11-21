@@ -5,12 +5,14 @@ import csv
 import hashlib
 import json
 import math
+import os
 import subprocess
 import tempfile
 import time as clock
 from pathlib import Path
 
 import numpy as np
+from dss_resolution import refine_velocity, refinement_transpose, richardson_return
 from scipy.ndimage import gaussian_filter, map_coordinates
 from scipy.optimize import minimize
 
@@ -227,6 +229,11 @@ class Cycle:
             raise RuntimeError(
                 f"incflo exited {completed.returncode} in {work}\n" + "\n".join(tail)
             )
+        if (
+            os.environ.get("DSS_EXPECT_HIP") == "1"
+            and "HIP initialized with 1 device" not in (work / "incflo.log").read_text()
+        ):
+            raise RuntimeError(f"Expected one visible HIP device in {work}")
         val, err, time, steps = np.loadtxt(work / "dss_result.txt")
         if steps != self.steps or abs(time - T_END) > 1.0e-12 or not np.isfinite(val):
             raise RuntimeError(f"Invalid or incomplete cycle in {work}")
@@ -238,6 +245,52 @@ class Cycle:
             if not np.isfinite(g).all():
                 raise RuntimeError("Nonfinite velocity gradient")
         return val, err, g
+
+
+class RichardsonCycle:
+    """Evaluate one common control and pull each native adjoint back to that control."""
+
+    def __init__(self, exe, inputs, grids, steps, order):
+        if (
+            len(grids) != 3
+            or len(steps) != 3
+            or grids[0] < MIN_SEARCH_GRID
+            or not grids[0] < grids[1] < grids[2]
+            or min(steps) < 1
+            or any(s * grids[0] != steps[0] * n for n, s in zip(grids, steps))
+            or not math.isfinite(order)
+            or order <= 0
+        ):
+            raise ValueError(
+                "Use three increasing grids with at least 128 cells per dimension, "
+                "positive order and constant steps/grid"
+            )
+        self.grids, self.steps, self.order = grids, steps, order
+        self.cycles = [Cycle(exe, inputs, n, s) for n, s in zip(grids, steps)]
+        self.last = {}
+
+    def run(self, u, work, gradient, plots=False):
+        errors, gradients = [], []
+        for i, (n, cycle) in enumerate(zip(self.grids, self.cycles)):
+            directory = work if i == 0 else work / f"n{n}"
+            directory.mkdir(exist_ok=True)
+            _, err, g = cycle.run(refine_velocity(u, n), directory, gradient, plots)
+            errors.append(float(err))
+            if gradient:
+                gradients.append(refinement_transpose(g, self.grids[0]))
+            del g
+        guide, weights = richardson_return(errors, self.grids, self.order)
+        self.last = {
+            **guide,
+            "returns": errors,
+            "native_adjoint_weights": weights.tolist(),
+        }
+        g = None
+        if gradient:
+            g = np.zeros_like(u)
+            for weight, level_gradient in zip(weights, gradients):
+                g += weight * level_gradient
+        return 0.5 * guide["score"] ** 2, guide["score"], g
 
 
 def check(args):
@@ -290,9 +343,20 @@ def search(args):
         m <= 0 or m % 19 for m in args.harmonics
     ):
         raise ValueError("Choose distinct positive multiples of 19 as harmonics")
+    triplet = getattr(args, "richardson_grids", None)
+    cycle = (
+        RichardsonCycle(
+            args.exe,
+            args.inputs,
+            [args.n, *triplet],
+            [args.steps, *args.richardson_steps],
+            args.richardson_order,
+        )
+        if triplet
+        else Cycle(args.exe, args.inputs, args.n, args.steps)
+    )
     seed = search_seed(args.seed, args.n)
     modes = CylindricalModes(seed, args.nr, args.nz, args.harmonics)
-    cycle = Cycle(args.exe, args.inputs, args.n, args.steps)
     args.out.mkdir(parents=True, exist_ok=False)
     root = args.out.resolve()
     rng = np.random.default_rng(args.random_seed)
@@ -312,6 +376,7 @@ def search(args):
     ):
         raise RuntimeError("Cylindrical coefficient transpose test failed")
     rows = []
+    grid_history = []
     with (
         tempfile.TemporaryDirectory(dir=root) as tmp,
         (root / "evaluations.csv").open("w") as stream,
@@ -325,13 +390,53 @@ def search(args):
             started = clock.monotonic()
             j, err, g = cycle.run(seed + modes.forward(c), Path(tmp), True)
             grad = modes.project(modes.transpose(g))
+            elapsed = clock.monotonic() - started
+            if triplet:
+                grid_history.append(dict(cycle.last))
+                if not rows and getattr(args, "check_direction", False):
+                    direction = grad / np.linalg.norm(grad)
+                    checks = []
+                    for h in (1.0e-5, 2.0e-6):
+                        with tempfile.TemporaryDirectory(dir=root) as spot:
+                            plus = cycle.run(
+                                seed + modes.forward(c + h * direction),
+                                Path(spot),
+                                False,
+                            )[0]
+                            minus = cycle.run(
+                                seed + modes.forward(c - h * direction),
+                                Path(spot),
+                                False,
+                            )[0]
+                        central = (plus - minus) / (2 * h)
+                        adjoint = float(np.vdot(grad, direction))
+                        relative = abs(central - adjoint) / max(
+                            abs(central), abs(adjoint), 1e-14
+                        )
+                        checks.append(
+                            {
+                                "h": h,
+                                "central": central,
+                                "adjoint": adjoint,
+                                "relative": relative,
+                            }
+                        )
+                        if relative < 2.0e-3:
+                            break
+                    (root / "directional-check.json").write_text(
+                        json.dumps(checks, indent=2) + "\n"
+                    )
+                    if relative >= 2.0e-3:
+                        raise RuntimeError(
+                            f"Three-grid coefficient derivative failed: {checks}"
+                        )
             rows.append(
                 (
                     len(rows) + 1,
                     j,
                     err,
                     np.linalg.norm(grad),
-                    clock.monotonic() - started,
+                    elapsed,
                 )
             )
             writer.writerow(rows[-1])
@@ -383,6 +488,19 @@ def search(args):
         "evaluations": len(rows),
         "termination": str(result.message),
     }
+    if triplet:
+        report.update(
+            {
+                "grids": cycle.grids,
+                "steps_by_grid": cycle.steps,
+                "first_guided_return": rows[0][2],
+                "final_guided_return": err,
+                "first_return": grid_history[0]["returns"][0],
+                "final_return": cycle.last["returns"][0],
+                "guided_evaluations": grid_history,
+                "accepted_guide": cycle.last,
+            }
+        )
     pending = root / "search.json.tmp"
     pending.write_text(json.dumps(report, indent=2) + "\n")
     pending.replace(root / "search.json")
@@ -414,6 +532,28 @@ if __name__ == "__main__":
     opt.add_argument("--random-seed", type=int, required=True)
     opt.add_argument("--n", type=int, default=MIN_SEARCH_GRID)
     opt.add_argument("--steps", type=int, default=DEFAULT_SEARCH_STEPS)
+    resolution = opt.add_mutually_exclusive_group()
+    resolution.add_argument(
+        "--single-grid",
+        action="store_true",
+        help="Optimize the native single-grid objective",
+    )
+    resolution.add_argument(
+        "--richardson-grids", type=int, nargs=2, metavar=("MIDDLE", "FINE")
+    )
+    opt.add_argument(
+        "--richardson-steps",
+        type=int,
+        nargs=2,
+        default=(120, 144),
+        metavar=("MIDDLE", "FINE"),
+    )
+    opt.add_argument("--richardson-order", type=float, default=2.0)
+    opt.add_argument(
+        "--check-direction",
+        action="store_true",
+        help="Check the first three-grid coefficient gradient with centered differences",
+    )
     opt.add_argument("--nr", type=int, default=9)
     opt.add_argument("--nz", type=int, default=7)
     opt.add_argument("--harmonics", type=int, nargs="+", default=[19])
@@ -432,4 +572,8 @@ if __name__ == "__main__":
     elif args.action == "check":
         check(args)
     else:
+        if not args.single_grid and args.richardson_grids is None:
+            args.richardson_grids = (160, 192)
+        if args.single_grid and args.check_direction:
+            parser.error("--check-direction checks the three-grid gradient")
         search(args)

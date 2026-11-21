@@ -1,14 +1,15 @@
 """Replay an optimized velocity and compare its vorticity at both ends of one cycle."""
 
 import argparse
+import hashlib
 import json
 import math
 from pathlib import Path
 
 import numpy as np
 from compare_dss_cycle import RADIUS, interpolate, read_snapshot, relative_l2
+from dss_resolution import holdout_prediction, refine_velocity
 from optimize_dss import Cycle, S
-from scipy.fft import irfft, rfft
 from scipy.integrate import trapezoid
 from scipy.interpolate import RegularGridInterpolator
 
@@ -18,28 +19,7 @@ PLOT_AXIS = np.linspace(-55, 55, 221)
 RADII = np.linspace(0, 65, 131)
 
 
-def refine_velocity(velocity, n):
-    """Sample the same periodic trigonometric interpolant at finer cell centers."""
-    source_n = velocity.shape[-1]
-    if n < source_n:
-        raise ValueError("The replay grid must be at least as fine as the saved grid")
-    if n == source_n:
-        return velocity
-    modes = np.arange(source_n // 2 + 1)
-    shift = np.exp(1j * np.pi * modes * (1 / n - 1 / source_n))
-    if source_n % 2 == 0:
-        # Split the real coarse Nyquist cosine between its two fine-grid modes.
-        shift[-1] *= 0.5
-    for axis in (1, 2, 3):
-        spectrum = rfft(velocity, axis=axis, norm="forward")
-        shape = [1] * velocity.ndim
-        shape[axis] = len(shift)
-        spectrum *= shift.reshape(shape)
-        velocity = irfft(spectrum, n=n, axis=axis, norm="forward")
-    return velocity
-
-
-def replay(report, control, exe, inputs, out, n, steps):
+def replay(report, control, exe, inputs, out, n, steps, expected_hash=None):
     source_n = report["grid"]
     count = 3 * source_n**3
     if control.stat().st_size != count * np.dtype(np.float64).itemsize:
@@ -47,6 +27,13 @@ def replay(report, control, exe, inputs, out, n, steps):
     velocity = np.fromfile(control, dtype=np.float64).reshape(
         3, source_n, source_n, source_n
     )
+    if (
+        expected_hash is not None
+        and hashlib.sha256(memoryview(velocity).cast("B")).hexdigest() != expected_hash
+    ):
+        raise ValueError(
+            f"Accepted control hash disagrees with its measured score in {control}"
+        )
     if not np.isfinite(velocity).all() or steps < 1:
         raise ValueError("Replay requires a finite velocity and a positive step count")
     cycle = Cycle(exe, inputs, n, steps)
@@ -257,6 +244,12 @@ if __name__ == "__main__":
     report = json.loads((out / "selected-search.json").read_text())
     reference = out / "selected-fine.json"
     target = json.loads(reference.read_text()) if reference.exists() else report
+    if not reference.exists() and "grids" in report:
+        target = {
+            **report,
+            "grid": report["grids"][-1],
+            "steps": report["steps_by_grid"][-1],
+        }
     grid = target["grid"] if args.grid is None else args.grid
     steps = target["steps"] if args.steps is None else args.steps
     if args.from_plots:
@@ -271,6 +264,7 @@ if __name__ == "__main__":
             out,
             grid,
             steps,
+            expected_hash=target.get("control_sha256"),
         )
     label = f"Seed {report['random_seed']}"
     if "trial" in target:
@@ -287,4 +281,12 @@ if __name__ == "__main__":
     (out / "vorticity-diagnostics.json").write_text(
         json.dumps(metrics, indent=2) + "\n"
     )
+    guidance = out / "selected-richardson.json"
+    if (
+        guidance.is_file()
+        and grid > target["grid"]
+        and steps * target["grid"] == target["steps"] * grid
+    ):
+        audit = holdout_prediction(json.loads(guidance.read_text()), target, metrics)
+        (out / "richardson-holdout.json").write_text(json.dumps(audit, indent=2) + "\n")
     print(json.dumps(metrics, indent=2))
